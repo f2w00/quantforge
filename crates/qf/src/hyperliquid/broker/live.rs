@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::Address;
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
@@ -51,6 +52,8 @@ pub struct HlLiveBrokerConfig {
     pub account_address: Address,
     pub metadata_refresh_interval: std::time::Duration,
     pub connect_timeout: std::time::Duration,
+    pub freshness_max_age: std::time::Duration,
+    pub reconciliation_interval: std::time::Duration,
 }
 
 pub struct HyperliquidLiveBroker {
@@ -66,6 +69,17 @@ pub struct HyperliquidLiveBroker {
     network: HlNetwork,
     order_updates: RwLock<Vec<Value>>,
     fills: RwLock<Vec<Value>>,
+    account_address: String,
+    freshness_max_age: std::time::Duration,
+    freshness: RwLock<HlFreshness>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct HlFreshness {
+    metadata: Option<DateTime<Utc>>,
+    mids: Option<DateTime<Utc>>,
+    account: Option<DateTime<Utc>>,
+    open_orders: Option<DateTime<Utc>>,
 }
 
 impl HyperliquidLiveBroker {
@@ -99,6 +113,8 @@ impl HyperliquidLiveBroker {
             signer,
             ws,
             config.network,
+            user.clone(),
+            config.freshness_max_age,
         ));
 
         broker
@@ -115,7 +131,10 @@ impl HyperliquidLiveBroker {
             .wait_for_subscriptions(events, config.connect_timeout)
             .await?;
         broker.spawn_event_consumer(events);
-        std::sync::Arc::clone(&broker).spawn_metadata_refresh(config.metadata_refresh_interval);
+        std::sync::Arc::clone(&broker).spawn_background_tasks(
+            config.metadata_refresh_interval,
+            config.reconciliation_interval,
+        );
         Ok(broker)
     }
 
@@ -130,7 +149,11 @@ impl HyperliquidLiveBroker {
         signer: std::sync::Arc<HyperliquidSigner>,
         ws: HyperliquidWsClient,
         network: HlNetwork,
+        account_address: String,
+        freshness_max_age: std::time::Duration,
     ) -> Self {
+        let metadata_updated_at = metadata.updated_at;
+        let mids_updated_at = mids.updated_at;
         Self {
             strategy_id,
             state: RwLock::new(state),
@@ -144,6 +167,14 @@ impl HyperliquidLiveBroker {
             network,
             order_updates: RwLock::new(Vec::new()),
             fills: RwLock::new(Vec::new()),
+            account_address,
+            freshness_max_age,
+            freshness: RwLock::new(HlFreshness {
+                metadata: metadata_updated_at,
+                mids: mids_updated_at,
+                account: Some(Utc::now()),
+                open_orders: Some(Utc::now()),
+            }),
         }
     }
 
@@ -192,18 +223,14 @@ impl HyperliquidLiveBroker {
 
     fn apply_ws_event(&self, message: Value) -> Result<(), HlBrokerError> {
         match message.get("channel").and_then(Value::as_str) {
-            Some("allMids") => self
-                .mids
-                .write()
-                .map_err(|_| HlBrokerError::StateUnavailable)?
-                .apply_ws_message(&message)
-                .map_err(transport_error),
+            Some("allMids") => self.apply_mids_event(&message),
             Some("clearinghouseState") => {
                 let account = parse_ws_clearinghouse_state(&message).map_err(transport_error)?;
                 self.state
                     .write()
                     .map_err(|_| HlBrokerError::StateUnavailable)?
                     .account = account;
+                self.mark_fresh(|freshness| freshness.account = Some(Utc::now()))?;
                 Ok(())
             }
             Some("openOrders") => {
@@ -212,6 +239,7 @@ impl HyperliquidLiveBroker {
                     .write()
                     .map_err(|_| HlBrokerError::StateUnavailable)?
                     .open_orders = open_orders;
+                self.mark_fresh(|freshness| freshness.open_orders = Some(Utc::now()))?;
                 Ok(())
             }
             Some("orderUpdates") => {
@@ -226,6 +254,52 @@ impl HyperliquidLiveBroker {
         }
     }
 
+    fn apply_mids_event(&self, message: &Value) -> Result<(), HlBrokerError> {
+        self.mids
+            .write()
+            .map_err(|_| HlBrokerError::StateUnavailable)?
+            .apply_ws_message(message)
+            .map_err(transport_error)?;
+        self.mark_fresh(|freshness| freshness.mids = Some(Utc::now()))
+    }
+
+    fn mark_fresh(&self, update: impl FnOnce(&mut HlFreshness)) -> Result<(), HlBrokerError> {
+        let mut freshness = self
+            .freshness
+            .write()
+            .map_err(|_| HlBrokerError::StateUnavailable)?;
+        update(&mut freshness);
+        Ok(())
+    }
+
+    fn is_fresh(&self, field: Option<DateTime<Utc>>) -> bool {
+        field
+            .map(|updated_at| {
+                Utc::now()
+                    .signed_duration_since(updated_at)
+                    .to_std()
+                    .map(|age| age <= self.freshness_max_age)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+    }
+
+    fn ensure_trading_state_fresh(&self) -> Result<(), HlBrokerError> {
+        let freshness = self
+            .freshness
+            .read()
+            .map_err(|_| HlBrokerError::StateUnavailable)?
+            .clone();
+        if !self.is_fresh(freshness.metadata)
+            || !self.is_fresh(freshness.mids)
+            || !self.is_fresh(freshness.account)
+            || !self.is_fresh(freshness.open_orders)
+        {
+            return Err(HlBrokerError::StateUnavailable);
+        }
+        Ok(())
+    }
+
     pub async fn refresh_metadata(&self) -> Result<(), HlBrokerError> {
         let snapshot = self
             .client
@@ -238,6 +312,10 @@ impl HyperliquidLiveBroker {
             .metadata
             .write()
             .map_err(|_| HlBrokerError::StateUnavailable)? = snapshot;
+        self.freshness
+            .write()
+            .map_err(|_| HlBrokerError::StateUnavailable)?
+            .metadata = Some(Utc::now());
         Ok(())
     }
 
@@ -253,6 +331,10 @@ impl HyperliquidLiveBroker {
             .mids
             .write()
             .map_err(|_| HlBrokerError::StateUnavailable)? = snapshot;
+        self.freshness
+            .write()
+            .map_err(|_| HlBrokerError::StateUnavailable)?
+            .mids = Some(Utc::now());
         Ok(())
     }
 
@@ -267,15 +349,36 @@ impl HyperliquidLiveBroker {
         self.mids.read().ok()?.mids.get(coin).copied()
     }
 
-    pub fn spawn_metadata_refresh(
+    pub fn spawn_background_tasks(
         self: std::sync::Arc<Self>,
-        interval: std::time::Duration,
+        metadata_interval: std::time::Duration,
+        reconciliation_interval: std::time::Duration,
     ) -> tokio::task::JoinHandle<()> {
+        let metadata_broker = std::sync::Arc::clone(&self);
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
+            let mut ticker = tokio::time::interval(metadata_interval);
             loop {
                 ticker.tick().await;
-                let _ = self.refresh_metadata().await;
+                let _ = metadata_broker.refresh_metadata().await;
+            }
+        });
+
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(reconciliation_interval);
+            loop {
+                ticker.tick().await;
+                if let Ok(account) = self.client.clearinghouse_state(&self.account_address).await {
+                    if let Ok(mut state) = self.state.write() {
+                        state.account = account;
+                    }
+                    let _ = self.mark_fresh(|freshness| freshness.account = Some(Utc::now()));
+                }
+                if let Ok(open_orders) = self.client.open_orders(&self.account_address).await {
+                    if let Ok(mut state) = self.state.write() {
+                        state.open_orders = open_orders;
+                    }
+                    let _ = self.mark_fresh(|freshness| freshness.open_orders = Some(Utc::now()));
+                }
             }
         })
     }
@@ -303,6 +406,20 @@ fn current_millis() -> u64 {
 fn transport_error(error: impl std::fmt::Display) -> HlBrokerError {
     HlBrokerError::Transport {
         message: error.to_string(),
+    }
+}
+
+fn protected_price(
+    reference: crate::core::Decimal,
+    side: crate::core::Side,
+    max_slippage_bps: u32,
+) -> crate::core::Decimal {
+    let slippage =
+        crate::core::Decimal::from(max_slippage_bps) / crate::core::Decimal::from(10_000u32);
+    if side == crate::core::Side::Buy {
+        reference * (crate::core::Decimal::ONE + slippage)
+    } else {
+        reference * (crate::core::Decimal::ONE - slippage)
     }
 }
 
@@ -338,35 +455,51 @@ impl HyperliquidBroker for HyperliquidLiveBroker {
         request
             .validate()
             .map_err(|message| HlBrokerError::InvalidRequest { message })?;
+        self.ensure_trading_state_fresh()?;
         if request.client_order_id.is_none() {
             request.client_order_id = Some(self.next_client_order_id());
         }
         let price = match &request.order_type {
             HlOrderType::Limit { limit_price, .. } => *limit_price,
-            HlOrderType::Market { max_slippage_bps } => {
-                let mid = self
-                    .mid_price(&request.coin)
-                    .ok_or(HlBrokerError::StateUnavailable)?;
-                let slippage = crate::core::Decimal::from(*max_slippage_bps)
-                    / crate::core::Decimal::from(10_000u32);
-                if request.side == crate::core::Side::Buy {
-                    mid * (crate::core::Decimal::ONE + slippage)
-                } else {
-                    mid * (crate::core::Decimal::ONE - slippage)
+            HlOrderType::Market { max_slippage_bps } => protected_price(
+                self.mid_price(&request.coin)
+                    .ok_or(HlBrokerError::StateUnavailable)?,
+                request.side,
+                *max_slippage_bps,
+            ),
+            HlOrderType::Trigger {
+                trigger_price,
+                execution,
+                ..
+            } => match execution {
+                crate::hyperliquid::types::HlTriggerExecution::Market { max_slippage_bps } => {
+                    protected_price(*trigger_price, request.side, *max_slippage_bps)
                 }
-            }
-            HlOrderType::Trigger { .. } => return Err(HlBrokerError::StateUnavailable),
+                crate::hyperliquid::types::HlTriggerExecution::Limit { limit_price } => {
+                    *limit_price
+                }
+            },
         };
         let asset = {
             let metadata = self
                 .metadata
                 .read()
                 .map_err(|_| HlBrokerError::StateUnavailable)?;
-            metadata.asset(&request.coin).map(|asset| asset.asset_id)
+            metadata
+                .asset(&request.coin)
+                .map(|asset| (asset.asset_id, asset.size_decimals))
         };
-        if asset.is_none() {
+        let (asset, size_decimals) = asset.ok_or_else(|| HlBrokerError::InvalidRequest {
+            message: format!("unknown Hyperliquid coin {}", request.coin.0),
+        })?;
+        if request.size.scale() > size_decimals {
             return Err(HlBrokerError::InvalidRequest {
-                message: format!("unknown Hyperliquid coin {}", request.coin.0),
+                message: format!(
+                    "order size has {} decimals; {} allowed for {}",
+                    request.size.scale(),
+                    size_decimals,
+                    request.coin.0
+                ),
             });
         }
         let (account, open_order_count) = {
@@ -389,7 +522,6 @@ impl HyperliquidBroker for HyperliquidLiveBroker {
         }
         let signer = &self.signer;
         let ws = &self.ws;
-        let asset = asset.ok_or(HlBrokerError::StateUnavailable)?;
         let action = request.to_order_action(asset, price);
         let nonce = signer.next_nonce();
         let expires_after = request

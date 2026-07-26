@@ -23,50 +23,65 @@ impl HyperliquidWsClient {
         base_url: impl Into<String>,
     ) -> anyhow::Result<(Self, mpsc::Receiver<Value>)> {
         let base_url = base_url.into();
-        let (stream, _) = connect_async(&base_url)
-            .await
-            .context("connect Hyperliquid websocket")?;
-        let (mut sink, mut source) = stream.split();
         let (writer, mut outbound) = mpsc::channel::<Message>(128);
         let (events, event_rx) = mpsc::channel(128);
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let pending_reader = Arc::clone(&pending);
+        let reconnect_url = base_url.clone();
 
         tokio::spawn(async move {
-            while let Some(message) = outbound.recv().await {
-                if sink.send(message).await.is_err() {
-                    break;
-                }
-            }
-        });
-
-        tokio::spawn(async move {
-            while let Some(message) = source.next().await {
-                let value = match message {
-                    Ok(Message::Text(text)) => serde_json::from_str::<Value>(&text),
-                    Ok(Message::Binary(bytes)) => serde_json::from_slice(&bytes),
-                    Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => continue,
-                    Ok(Message::Close(_)) | Err(_) => break,
-                    _ => continue,
-                };
-                let Ok(value) = value else { continue };
-                if let Some(id) = value.pointer("/data/id").and_then(Value::as_u64) {
-                    if let Some(sender) = pending_reader
-                        .lock()
-                        .ok()
-                        .and_then(|mut map| map.remove(&id))
-                    {
-                        let _ = sender.send(Ok(value));
+            let mut subscriptions: Vec<Message> = Vec::new();
+            loop {
+                let stream = match connect_async(&reconnect_url).await {
+                    Ok((stream, _)) => stream,
+                    Err(_) => {
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                         continue;
                     }
+                };
+                let (mut sink, mut source) = stream.split();
+                for subscription in &subscriptions {
+                    let _ = sink.send(subscription.clone()).await;
                 }
-                let _ = events.send(value).await;
-            }
 
-            if let Ok(mut map) = pending_reader.lock() {
-                for (_, sender) in map.drain() {
-                    let _ = sender.send(Err(anyhow::anyhow!("websocket connection closed")));
+                loop {
+                    tokio::select! {
+                        Some(message) = outbound.recv() => {
+                            if let Message::Text(text) = &message {
+                                if let Ok(value) = serde_json::from_str::<Value>(text) {
+                                    if value.get("method").and_then(Value::as_str) == Some("subscribe")
+                                        && !subscriptions.iter().any(|item| item == &message)
+                                    {
+                                        subscriptions.push(message.clone());
+                                    }
+                                }
+                            }
+                            if sink.send(message).await.is_err() {
+                                break;
+                            }
+                        }
+                        incoming = source.next() => {
+                            let Some(incoming) = incoming else { break };
+                            let value = match incoming {
+                                Ok(Message::Text(text)) => serde_json::from_str::<Value>(&text),
+                                Ok(Message::Binary(bytes)) => serde_json::from_slice(&bytes),
+                                Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => continue,
+                                Ok(Message::Close(_)) | Err(_) => break,
+                                _ => continue,
+                            };
+                            let Ok(value) = value else { continue };
+                            if let Some(id) = value.pointer("/data/id").and_then(Value::as_u64) {
+                                if let Some(sender) = pending_reader.lock().ok().and_then(|mut map| map.remove(&id)) {
+                                    let _ = sender.send(Ok(value));
+                                    continue;
+                                }
+                            }
+                            let _ = events.send(value).await;
+                        }
+                        else => break,
+                    }
                 }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
         });
 
