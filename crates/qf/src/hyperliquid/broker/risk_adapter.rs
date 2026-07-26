@@ -2,13 +2,14 @@ use crate::core::{Decimal, StrategyId, Symbol};
 use crate::hyperliquid::types::{HlAccountState, HlOrderRequest};
 use crate::risk::RiskCheckInput;
 
-pub fn order_risk_input(
+pub fn order_risk_input_at_price(
     strategy_id: StrategyId,
     account: &HlAccountState,
     request: &HlOrderRequest,
+    price: Decimal,
     open_order_count: usize,
 ) -> RiskCheckInput {
-    let order_notional = request.limit_price.unwrap_or(Decimal::ZERO) * request.size.abs();
+    let order_notional = price * request.size.abs();
 
     RiskCheckInput {
         strategy_id,

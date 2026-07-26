@@ -5,12 +5,17 @@ pub mod position;
 pub mod response;
 
 pub use account::HlAccountState;
-pub use market::{HlCoin, HlMarkPrice};
+pub use market::{
+    HlAssetMeta, HlCoin, HlMarkPrice, HlMetaResponse, HlMetaUniverseEntry, HlMetadataSnapshot,
+    HlMidSnapshot,
+};
 pub use order::{
     HlAssetId, HlCancelAction, HlCancelByCloidAction, HlCancelRequest, HlCancelTarget,
-    HlCloseOptions, HlExchangeAction, HlOpenOrder, HlOrderAction, HlOrderGrouping, HlOrderRequest,
-    HlOrderType, HlSignature, HlSignedAction, HlTimeInForce, HlTriggerKind, HlWireCancel,
-    HlWireCancelByCloid, HlWireOrder,
+    HlClientOrderId, HlCloseRequest, HlCloseSize, HlExchangeAction, HlOpenOrder, HlOrderAction,
+    HlOrderGrouping, HlOrderRequest, HlOrderType, HlSignature, HlSignedAction, HlTimeInForce,
+    HlTriggerExecution, HlTriggerKind, HlWireCancel, HlWireCancelByCloid, HlWireOrder,
 };
 pub use position::HlPosition;
-pub use response::{HlCancelResponse, HlCancelStatus, HlOrderResponse, HlOrderStatus, HlResponse};
+pub use response::{
+    HlCancelResponse, HlCancelStatus, HlOrderOutcome, HlOrderResult, HlResponse, HlSubmittedOrder,
+};

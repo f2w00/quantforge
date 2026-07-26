@@ -51,31 +51,47 @@ impl HlTriggerKind {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum HlOrderType {
+    Market {
+        max_slippage_bps: u32,
+    },
     Limit {
+        limit_price: Decimal,
         tif: HlTimeInForce,
     },
     Trigger {
-        is_market: bool,
         trigger_price: Decimal,
         trigger_kind: HlTriggerKind,
+        execution: HlTriggerExecution,
     },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub enum HlTriggerExecution {
+    Market { max_slippage_bps: u32 },
+    Limit { limit_price: Decimal },
 }
 
 impl HlOrderType {
     pub fn to_hyperliquid_json(&self) -> serde_json::Value {
         match self {
-            Self::Limit { tif } => json!({
+            // Hyperliquid 没有独立的市价单类型，实盘发送时由价格保护的 IOC 单承载。
+            Self::Market { .. } => json!({
+                "limit": {
+                    "tif": "Ioc",
+                }
+            }),
+            Self::Limit { tif, .. } => json!({
                 "limit": {
                     "tif": tif.as_hyperliquid_str(),
                 }
             }),
             Self::Trigger {
-                is_market,
                 trigger_price,
                 trigger_kind,
+                execution,
             } => json!({
                 "trigger": {
-                    "isMarket": is_market,
+                    "isMarket": matches!(execution, HlTriggerExecution::Market { .. }),
                     "triggerPx": trigger_price.to_string(),
                     "tpsl": trigger_kind.as_hyperliquid_str(),
                 }
@@ -110,33 +126,104 @@ impl Default for HlOrderGrouping {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct HlOrderRequest {
     pub coin: HlCoin,
-    pub asset: Option<HlAssetId>,
     pub side: Side,
     pub size: Decimal,
-    pub limit_price: Option<Decimal>,
     pub reduce_only: bool,
-    pub time_in_force: Option<TimeInForce>,
-    pub order_type: Option<HlOrderType>,
-    pub grouping: HlOrderGrouping,
-    pub client_order_id: Option<String>,
+    pub order_type: HlOrderType,
+    pub client_order_id: Option<HlClientOrderId>,
     pub expires_after: Option<Timestamp>,
-    pub raw: serde_json::Value,
 }
 
 impl HlOrderRequest {
-    pub fn order_type(&self) -> HlOrderType {
-        self.order_type
-            .clone()
-            .unwrap_or_else(|| HlOrderType::Limit {
-                tif: self.time_in_force.unwrap_or(TimeInForce::Gtc).into(),
-            })
+    pub fn validate(&self) -> Result<(), String> {
+        if self.size <= Decimal::ZERO {
+            return Err("order size must be positive".to_string());
+        }
+
+        match &self.order_type {
+            HlOrderType::Market { max_slippage_bps } => {
+                validate_slippage(*max_slippage_bps)?;
+            }
+            HlOrderType::Limit { limit_price, .. } => {
+                validate_price(*limit_price, "limit price")?;
+            }
+            HlOrderType::Trigger {
+                trigger_price,
+                execution,
+                ..
+            } => {
+                if !self.reduce_only {
+                    return Err("trigger TP/SL orders must be reduce-only".to_string());
+                }
+                validate_price(*trigger_price, "trigger price")?;
+                match execution {
+                    HlTriggerExecution::Market { max_slippage_bps } => {
+                        validate_slippage(*max_slippage_bps)?;
+                    }
+                    HlTriggerExecution::Limit { limit_price } => {
+                        validate_price(*limit_price, "trigger limit price")?;
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
-    pub fn to_order_action(&self, asset: HlAssetId) -> HlExchangeAction {
+    pub fn to_order_action(&self, asset: HlAssetId, price: Decimal) -> HlExchangeAction {
         HlExchangeAction::Order(HlOrderAction {
-            orders: vec![HlWireOrder::from_request(self, asset)],
-            grouping: self.grouping,
+            orders: vec![HlWireOrder::from_request(self, asset, price)],
+            grouping: HlOrderGrouping::Na,
         })
+    }
+}
+
+fn validate_price(price: Decimal, name: &str) -> Result<(), String> {
+    if price <= Decimal::ZERO {
+        return Err(format!("{name} must be positive"));
+    }
+    Ok(())
+}
+
+fn validate_slippage(max_slippage_bps: u32) -> Result<(), String> {
+    if max_slippage_bps >= 10_000 {
+        return Err("max slippage must be less than 10000 bps".to_string());
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Deserialize, Serialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct HlClientOrderId(String);
+
+impl HlClientOrderId {
+    pub fn new(value: impl Into<String>) -> Result<Self, String> {
+        let value = value.into();
+        let hex = value
+            .strip_prefix("0x")
+            .ok_or_else(|| "client order id must start with 0x".to_string())?;
+        if hex.len() != 32 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("client order id must contain exactly 16 hex bytes".to_string());
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for HlClientOrderId {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<HlClientOrderId> for String {
+    fn from(value: HlClientOrderId) -> Self {
+        value.0
     }
 }
 
@@ -176,7 +263,7 @@ impl HlCancelRequest {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum HlCancelTarget {
     OrderId(u64),
-    ClientOrderId(String),
+    ClientOrderId(HlClientOrderId),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -189,9 +276,19 @@ pub struct HlOpenOrder {
     pub reduce_only: bool,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub struct HlCloseOptions {
-    pub client_order_id: Option<String>,
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct HlCloseRequest {
+    pub coin: HlCoin,
+    pub size: HlCloseSize,
+    pub max_slippage_bps: u32,
+    pub client_order_id: Option<HlClientOrderId>,
+    pub expires_after: Option<Timestamp>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub enum HlCloseSize {
+    Full,
+    Exact(Decimal),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -202,18 +299,18 @@ pub struct HlWireOrder {
     pub size: Decimal,
     pub reduce_only: bool,
     pub order_type: HlOrderType,
-    pub client_order_id: Option<String>,
+    pub client_order_id: Option<HlClientOrderId>,
 }
 
 impl HlWireOrder {
-    pub fn from_request(request: &HlOrderRequest, asset: HlAssetId) -> Self {
+    pub fn from_request(request: &HlOrderRequest, asset: HlAssetId, price: Decimal) -> Self {
         Self {
             asset,
             is_buy: request.side == Side::Buy,
-            price: request.limit_price.unwrap_or(Decimal::ZERO),
+            price,
             size: request.size,
             reduce_only: request.reduce_only,
-            order_type: request.order_type(),
+            order_type: request.order_type.clone(),
             client_order_id: request.client_order_id.clone(),
         }
     }
@@ -229,7 +326,7 @@ impl HlWireOrder {
         });
 
         if let Some(client_order_id) = &self.client_order_id {
-            value["c"] = json!(client_order_id);
+            value["c"] = json!(client_order_id.as_str());
         }
 
         value
@@ -359,7 +456,7 @@ impl HlExchangeAction {
 pub struct HlSignature {
     pub r: String,
     pub s: String,
-    pub v: String,
+    pub v: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

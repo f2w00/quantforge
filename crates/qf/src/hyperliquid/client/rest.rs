@@ -1,12 +1,251 @@
+use chrono::Utc;
+use reqwest::Client;
+use serde::Deserialize;
+
+use crate::core::{Decimal, OrderId, Side};
+use crate::hyperliquid::types::{
+    HlAccountState, HlCoin, HlMetaResponse, HlMetadataSnapshot, HlMidSnapshot, HlOpenOrder,
+    HlPosition,
+};
+
 #[derive(Clone, Debug)]
 pub struct HyperliquidRestClient {
     pub base_url: String,
+    client: Client,
 }
 
 impl HyperliquidRestClient {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into(),
+            client: Client::new(),
         }
+    }
+
+    pub async fn meta(&self) -> anyhow::Result<HlMetadataSnapshot> {
+        let response: HlMetaResponse = self.info(serde_json::json!({ "type": "meta" })).await?;
+        Ok(response.into_snapshot(Utc::now()))
+    }
+
+    pub async fn all_mids(&self) -> anyhow::Result<HlMidSnapshot> {
+        let values: std::collections::HashMap<String, String> =
+            self.info(serde_json::json!({ "type": "allMids" })).await?;
+        let mids = values
+            .into_iter()
+            .map(|(coin, price)| Ok((HlCoin::new(coin), price.parse()?)))
+            .collect::<anyhow::Result<_>>()?;
+        Ok(HlMidSnapshot {
+            mids,
+            updated_at: Some(Utc::now()),
+        })
+    }
+
+    pub async fn clearinghouse_state(&self, user: &str) -> anyhow::Result<HlAccountState> {
+        let response: ClearinghouseStateWire = self
+            .info(serde_json::json!({
+                "type": "clearinghouseState",
+                "user": user,
+            }))
+            .await?;
+        response.try_into()
+    }
+
+    pub async fn open_orders(&self, user: &str) -> anyhow::Result<Vec<HlOpenOrder>> {
+        let response: Vec<OpenOrderWire> = self
+            .info(serde_json::json!({
+                "type": "openOrders",
+                "user": user,
+            }))
+            .await?;
+        response.into_iter().map(TryInto::try_into).collect()
+    }
+
+    async fn info<T: serde::de::DeserializeOwned>(
+        &self,
+        request: serde_json::Value,
+    ) -> anyhow::Result<T> {
+        let url = format!("{}/info", self.base_url.trim_end_matches('/'));
+        Ok(self
+            .client
+            .post(url)
+            .json(&request)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ClearinghouseStateWire {
+    margin_summary: MarginSummaryWire,
+    asset_positions: Vec<AssetPositionWire>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MarginSummaryWire {
+    account_value: String,
+    total_margin_used: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AssetPositionWire {
+    position: PositionWire,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PositionWire {
+    coin: String,
+    szi: String,
+    entry_px: Option<String>,
+    position_value: String,
+    leverage: LeverageWire,
+    liquidation_px: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LeverageWire {
+    value: u32,
+}
+
+impl TryFrom<ClearinghouseStateWire> for HlAccountState {
+    type Error = anyhow::Error;
+
+    fn try_from(value: ClearinghouseStateWire) -> Result<Self, Self::Error> {
+        let positions = value
+            .asset_positions
+            .into_iter()
+            .map(|asset| {
+                let position = asset.position;
+                Ok(HlPosition {
+                    coin: HlCoin::new(position.coin),
+                    size: position.szi.parse()?,
+                    entry_price: position.entry_px.map(|price| price.parse()).transpose()?,
+                    notional: position.position_value.parse::<Decimal>()?.abs(),
+                    leverage: Decimal::from(position.leverage.value),
+                    liquidation_price: position
+                        .liquidation_px
+                        .map(|price| price.parse())
+                        .transpose()?,
+                })
+            })
+            .collect::<anyhow::Result<_>>()?;
+        Ok(HlAccountState {
+            equity: value.margin_summary.account_value.parse()?,
+            margin_used: value.margin_summary.total_margin_used.parse()?,
+            positions,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OpenOrderWire {
+    coin: String,
+    oid: u64,
+    side: String,
+    sz: String,
+    limit_px: String,
+    #[serde(default)]
+    reduce_only: bool,
+}
+
+impl TryFrom<OpenOrderWire> for HlOpenOrder {
+    type Error = anyhow::Error;
+
+    fn try_from(value: OpenOrderWire) -> Result<Self, Self::Error> {
+        let side = match value.side.as_str() {
+            "B" => Side::Buy,
+            "A" => Side::Sell,
+            side => anyhow::bail!("unsupported Hyperliquid order side {side}"),
+        };
+        Ok(HlOpenOrder {
+            coin: HlCoin::new(value.coin),
+            order_id: OrderId::new(value.oid.to_string()),
+            side,
+            size: value.sz.parse()?,
+            limit_price: Some(value.limit_px.parse()?),
+            reduce_only: value.reduce_only,
+        })
+    }
+}
+
+pub(crate) fn parse_ws_clearinghouse_state(
+    message: &serde_json::Value,
+) -> anyhow::Result<HlAccountState> {
+    let value = message
+        .pointer("/data/clearinghouseState")
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("missing clearinghouseState data"))?;
+    serde_json::from_value::<ClearinghouseStateWire>(value)?.try_into()
+}
+
+pub(crate) fn parse_ws_open_orders(
+    message: &serde_json::Value,
+) -> anyhow::Result<Vec<HlOpenOrder>> {
+    let value = message
+        .pointer("/data/orders")
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("missing openOrders data"))?;
+    serde_json::from_value::<Vec<OpenOrderWire>>(value)?
+        .into_iter()
+        .map(TryInto::try_into)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_clearinghouse_snapshot() {
+        let message = serde_json::json!({
+            "data": {
+                "clearinghouseState": {
+                    "marginSummary": {
+                        "accountValue": "1000",
+                        "totalMarginUsed": "25"
+                    },
+                    "assetPositions": [{
+                        "position": {
+                            "coin": "BTC",
+                            "szi": "0.1",
+                            "entryPx": "100000",
+                            "positionValue": "10000",
+                            "leverage": {"value": 10},
+                            "liquidationPx": "90000"
+                        }
+                    }]
+                }
+            }
+        });
+        let account = parse_ws_clearinghouse_state(&message).unwrap();
+        assert_eq!(account.equity, "1000".parse().unwrap());
+        assert_eq!(account.positions[0].coin, HlCoin::new("BTC"));
+        assert_eq!(account.positions[0].size, "0.1".parse().unwrap());
+    }
+
+    #[test]
+    fn parses_open_orders_snapshot() {
+        let message = serde_json::json!({
+            "data": {
+                "orders": [{
+                    "coin": "ETH",
+                    "oid": 42,
+                    "side": "B",
+                    "sz": "1.5",
+                    "limitPx": "3000",
+                    "reduceOnly": false
+                }]
+            }
+        });
+        let orders = parse_ws_open_orders(&message).unwrap();
+        assert_eq!(orders[0].order_id.0, "42");
+        assert_eq!(orders[0].side, Side::Buy);
+        assert_eq!(orders[0].size, "1.5".parse().unwrap());
     }
 }

@@ -6,8 +6,18 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+alloy.workspace = true
+async-trait.workspace = true
 chrono.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
+rmp-serde.workspace = true
 rust_decimal.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tokio-tungstenite.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread"] }

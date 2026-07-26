@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-use crate::core::{Decimal, OrderId};
+use crate::core::{Decimal, OrderId, Side};
+use crate::hyperliquid::types::{HlClientOrderId, HlCoin};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct HlResponse {
@@ -8,9 +9,9 @@ pub struct HlResponse {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct HlOrderResponse {
-    pub order_id: Option<OrderId>,
-    pub statuses: Vec<HlOrderStatus>,
+pub struct HlOrderResult {
+    pub submitted: HlSubmittedOrder,
+    pub outcome: HlOrderOutcome,
     pub raw: serde_json::Value,
 }
 
@@ -22,8 +23,17 @@ pub struct HlCancelResponse {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub enum HlOrderStatus {
-    Accepted,
+pub struct HlSubmittedOrder {
+    pub coin: HlCoin,
+    pub side: Side,
+    pub size: Decimal,
+    pub limit_price: Decimal,
+    pub reduce_only: bool,
+    pub client_order_id: HlClientOrderId,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub enum HlOrderOutcome {
     Resting {
         order_id: OrderId,
     },
@@ -31,9 +41,6 @@ pub enum HlOrderStatus {
         order_id: OrderId,
         total_size: Decimal,
         avg_price: Decimal,
-    },
-    Error {
-        message: String,
     },
 }
 
