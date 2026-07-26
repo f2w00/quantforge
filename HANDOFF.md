@@ -65,6 +65,10 @@ Objective
   - Trigger Market/Limit 的 wire price 计算。
   - REST `orderStatus` 和 `/exchange` client 原语。
   - `orderUpdates` / `userFills` 的基础结构化内存投影，并保留 raw payload。
+  - `HlMarketConfig` 目标市场配置，`connect()` 中仅对 Cross 市场设置并确认杠杆。
+  - `updateLeverage` action 的 Alloy/rmp-serde 签名和 WS post。
+  - `calculate_order_size()`：按可用保证金比例、杠杆和价格计算向下量化的数量。
+  - 基于已有仓位、挂单和 pending 请求的 post-trade notional/leverage 风控。
 - 最近验证通过：
   ```text
   cargo fmt --all
@@ -73,16 +77,17 @@ Objective
   ```
   测试结果：
   ```text
-  15 passed
+  21 passed
   0 failed
   ```
-- 最近一轮修改尚未提交。
+- 最近已提交 `77dda3f feat(hyperliquid): 收紧实盘状态与请求语义`；当前本轮修改尚未提交。
 
 ### Active
 - 继续完成用户要求的“都实现”，重点剩余：
-  - 实现 `OutcomeUnknown` 后基于 cloid 的自动 order status reconciliation。
+  - `reconcile_order(cloid)` 基于 cloid 查询 orderStatus，并在查询成功后释放对应风险预留。
   - 为结构化事件增加持久化审计和成交账本。
   - 明确区分 WS 未发送失败与已发送但响应未知，之后再安全接入 REST `/exchange` fallback。
+  - WS 重连完成后重新确认目标市场的杠杆配置。
   - 继续补充测试和更新文档。
 - 当前代码中新增的 `HlLiveBrokerConfig` 字段：
   ```rust
@@ -108,8 +113,10 @@ Objective
 - WS 自动重连实现仍需审查：当前 `HyperliquidWsClient::connect()` 内部 supervisor 同时处理 outbound、inbound 和订阅重发，断线 pending request 的语义需要进一步确认。
 - REST reconciliation 失败已传播为对应 freshness 不可用，但尚未记录失败原因和连续失败次数。
 - `orderUpdates` / `userFills` 已有基础结构化投影，但尚不支持持久化成交账本、完整手续费和 realized PnL 审计。
-- REST `/exchange`、`orderStatus` 原语已实现；`OutcomeUnknown` 尚未自动按 cloid 对账。
+- REST `/exchange`、`orderStatus` 原语已实现；`reconcile_order(cloid)` 可供调用方处理
+  `OutcomeUnknown`，但重启后的自动恢复仍依赖后续订单意图持久化。
 - subaccount/vault 明确暂不实现。
+- isolated leverage/margin 明确暂不实现；当前 `set_leverage()` 会拒绝 `is_cross=false`。
 
 ## Next Move
 1. 为 `OutcomeUnknown` 增加基于 cloid 的 orderStatus 查询和恢复状态机。

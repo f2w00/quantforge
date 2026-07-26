@@ -255,7 +255,8 @@ impl HyperliquidBroker for HyperliquidBacktestBroker {
             &inner.state.account,
             &request,
             mark_price,
-            inner.state.open_orders.len(),
+            &inner.state.open_orders,
+            Decimal::ZERO,
         );
 
         if let RiskDecision::Rejected { violations } = self.risk_guard.check(&input) {

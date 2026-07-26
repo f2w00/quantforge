@@ -13,7 +13,8 @@ pub use order::{
     HlAssetId, HlCancelAction, HlCancelByCloidAction, HlCancelRequest, HlCancelTarget,
     HlClientOrderId, HlCloseRequest, HlCloseSize, HlExchangeAction, HlOpenOrder, HlOrderAction,
     HlOrderGrouping, HlOrderRequest, HlOrderType, HlSignature, HlSignedAction, HlTimeInForce,
-    HlTriggerExecution, HlTriggerKind, HlWireCancel, HlWireCancelByCloid, HlWireOrder,
+    HlTriggerExecution, HlTriggerKind, HlUpdateLeverageAction, HlWireCancel, HlWireCancelByCloid,
+    HlWireOrder,
 };
 pub use position::HlPosition;
 pub use response::{

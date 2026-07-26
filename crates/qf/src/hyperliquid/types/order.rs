@@ -415,6 +415,24 @@ pub struct HlCancelByCloidAction {
     pub fast: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct HlUpdateLeverageAction {
+    pub asset: HlAssetId,
+    pub is_cross: bool,
+    pub leverage: u32,
+}
+
+impl HlUpdateLeverageAction {
+    pub fn to_hyperliquid_json(&self) -> serde_json::Value {
+        json!({
+            "type": "updateLeverage",
+            "asset": self.asset.0,
+            "isCross": self.is_cross,
+            "leverage": self.leverage,
+        })
+    }
+}
+
 impl HlCancelByCloidAction {
     pub fn to_hyperliquid_json(&self) -> serde_json::Value {
         let mut value = json!({
@@ -440,6 +458,7 @@ pub enum HlExchangeAction {
     Order(HlOrderAction),
     Cancel(HlCancelAction),
     CancelByCloid(HlCancelByCloidAction),
+    UpdateLeverage(HlUpdateLeverageAction),
 }
 
 impl HlExchangeAction {
@@ -448,7 +467,32 @@ impl HlExchangeAction {
             Self::Order(action) => action.to_hyperliquid_json(),
             Self::Cancel(action) => action.to_hyperliquid_json(),
             Self::CancelByCloid(action) => action.to_hyperliquid_json(),
+            Self::UpdateLeverage(action) => action.to_hyperliquid_json(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serializes_update_leverage_action() {
+        let action = HlExchangeAction::UpdateLeverage(HlUpdateLeverageAction {
+            asset: HlAssetId(7),
+            is_cross: true,
+            leverage: 5,
+        });
+
+        assert_eq!(
+            action.to_hyperliquid_json(),
+            json!({
+                "type": "updateLeverage",
+                "asset": 7,
+                "isCross": true,
+                "leverage": 5,
+            })
+        );
     }
 }
 

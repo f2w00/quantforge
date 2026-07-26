@@ -361,6 +361,24 @@ WS 重连：连接恢复后立即刷新
 新增币种可以进入可交易集合；下架币种禁止新下单，但可以保留旧 metadata 用于已有
 订单的撤单、延迟 WS 消息解析和 reconciliation。
 
+## 杠杆与数量
+
+Hyperliquid 的杠杆是按 perp asset 设置，而不是账户全局设置。LiveBroker 的目标市场
+配置在 `connect()` 阶段发送 `updateLeverage` 并等待明确成功；任一配置失败时 Broker
+不会进入 ready 状态。当前实现仅支持 Cross，isolated 因需要独立保证金管理而明确拒绝。
+
+`calculate_order_size()` 使用以下保守计算：
+
+```text
+available_margin = max(equity - margin_used - reserve_margin, 0)
+margin = available_margin * margin_fraction
+notional = margin * leverage
+size = floor(notional / reference_price, size_decimals)
+```
+
+该 helper 只产生建议数量。下单时 Broker 仍会把现有仓位、非 reduce-only 挂单和
+并发中的 pending order notional 纳入 post-trade 风控。
+
 ## 初始化和状态同步
 
 LiveBroker 的连接初始化计划为：
@@ -400,6 +418,9 @@ LiveBroker 的连接初始化计划为：
 - LiveBroker metadata/mids 快照刷新入口和 metadata 定时刷新任务。
 - Alloy + `rmp-serde` 的 L1 action 签名基础设施；
 - 官方 Rust SDK limit order 签名兼容性测试。
+- `updateLeverage` action 的签名、WS post 与 Cross target-market 初始化配置。
+- 基于可用保证金比例、目标杠杆和价格的向下量化 size helper。
+- 现有仓位、挂单与 pending order notional 的 post-trade 风控计算。
 - LiveBroker 主账户 `connect().await` 初始化；
 - `allMids`、`clearinghouseState`、`openOrders`、`orderUpdates` 和 `userFills` 订阅；
 - 账户和挂单快照的 REST/WS 解析及权威状态更新。
@@ -412,7 +433,7 @@ LiveBroker 的连接初始化计划为：
 - WS 自动重连、断线恢复和 LiveBroker 事件消费；
 - 结构化事件的持久化审计和成交账本；
 - 账户 WS 订阅和本地状态 reconciliation；
-- OutcomeUnknown 基于 cloid 的自动 orderStatus 对账；
+- OutcomeUnknown 在进程重启后的自动 cloid orderStatus 对账；
 - 完整 timeout、幂等查询和 audit 测试；
 - PaperBroker。
 

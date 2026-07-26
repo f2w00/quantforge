@@ -3,6 +3,6 @@ pub mod client;
 pub mod types;
 
 pub use broker::{
-    HlLiveBrokerConfig, HlNetwork, HyperliquidBacktestBroker, HyperliquidBroker,
-    HyperliquidLiveBroker,
+    HlLiveBrokerConfig, HlMarketConfig, HlNetwork, HlSizingRequest, HlSizingResult,
+    HyperliquidBacktestBroker, HyperliquidBroker, HyperliquidLiveBroker, calculate_order_size,
 };

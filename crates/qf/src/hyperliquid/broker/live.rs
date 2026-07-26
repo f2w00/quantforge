@@ -1,5 +1,6 @@
-use std::sync::RwLock;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::Address;
@@ -7,7 +8,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
-use crate::core::StrategyId;
+use crate::core::{Decimal, StrategyId};
 use crate::hyperliquid::broker::HlBrokerError;
 use crate::hyperliquid::broker::risk_adapter::order_risk_input_at_price;
 use crate::hyperliquid::broker::state::HlBrokerState;
@@ -18,6 +19,7 @@ use crate::hyperliquid::types::{
     HlAccountState, HlCancelRequest, HlCancelResponse, HlCancelStatus, HlClientOrderId,
     HlCloseRequest, HlCloseSize, HlCoin, HlExchangeAction, HlMetadataSnapshot, HlMidSnapshot,
     HlOpenOrder, HlOrderOutcome, HlOrderRequest, HlOrderResult, HlOrderType, HlSubmittedOrder,
+    HlUpdateLeverageAction,
 };
 use crate::risk::{RiskDecision, RiskGuard};
 
@@ -54,6 +56,31 @@ pub struct HlLiveBrokerConfig {
     pub connect_timeout: std::time::Duration,
     pub freshness_max_age: std::time::Duration,
     pub reconciliation_interval: std::time::Duration,
+    pub markets: Vec<HlMarketConfig>,
+}
+
+#[derive(Clone, Debug)]
+pub struct HlMarketConfig {
+    pub coin: HlCoin,
+    pub leverage: u32,
+    pub is_cross: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct HlSizingRequest {
+    pub margin_fraction: Decimal,
+    pub leverage: u32,
+    pub reserve_margin: Decimal,
+    pub reference_price: Decimal,
+}
+
+#[derive(Clone, Debug)]
+pub struct HlSizingResult {
+    pub size: Decimal,
+    pub margin: Decimal,
+    pub notional: Decimal,
+    pub available_margin: Decimal,
+    pub reference_price: Decimal,
 }
 
 pub struct HyperliquidLiveBroker {
@@ -72,6 +99,7 @@ pub struct HyperliquidLiveBroker {
     account_address: String,
     freshness_max_age: std::time::Duration,
     freshness: RwLock<HlFreshness>,
+    pending_notional: Mutex<HashMap<HlClientOrderId, Decimal>>,
 }
 
 #[derive(Clone, Debug)]
@@ -149,6 +177,9 @@ impl HyperliquidLiveBroker {
         let events = broker
             .wait_for_subscriptions(events, config.connect_timeout)
             .await?;
+        for market in &config.markets {
+            broker.set_leverage(market).await?;
+        }
         broker.spawn_event_consumer(events);
         std::sync::Arc::clone(&broker).spawn_background_tasks(
             config.metadata_refresh_interval,
@@ -194,6 +225,7 @@ impl HyperliquidLiveBroker {
                 account: Some(Utc::now()),
                 open_orders: Some(Utc::now()),
             }),
+            pending_notional: Mutex::new(HashMap::new()),
         }
     }
 
@@ -452,6 +484,96 @@ impl HyperliquidLiveBroker {
             .await
             .map_err(transport_error)
     }
+
+    pub async fn reconcile_order(
+        &self,
+        client_order_id: &HlClientOrderId,
+    ) -> Result<Value, HlBrokerError> {
+        let status = self.order_status(client_order_id.as_str()).await?;
+        self.release_pending_notional(client_order_id);
+        Ok(status)
+    }
+
+    pub async fn set_leverage(&self, market: &HlMarketConfig) -> Result<(), HlBrokerError> {
+        if market.leverage == 0 {
+            return Err(HlBrokerError::InvalidRequest {
+                message: "leverage must be positive".to_string(),
+            });
+        }
+        if !market.is_cross {
+            return Err(HlBrokerError::InvalidRequest {
+                message: "isolated leverage is not supported yet".to_string(),
+            });
+        }
+        let asset = self
+            .metadata
+            .read()
+            .map_err(|_| HlBrokerError::StateUnavailable)?
+            .asset(&market.coin)
+            .cloned()
+            .ok_or_else(|| HlBrokerError::InvalidRequest {
+                message: format!("unknown Hyperliquid coin {}", market.coin.0),
+            })?;
+        if let Some(max_leverage) = asset.max_leverage {
+            if market.leverage > max_leverage {
+                return Err(HlBrokerError::InvalidRequest {
+                    message: format!(
+                        "leverage {} exceeds {} maximum of {}",
+                        market.leverage, market.coin.0, max_leverage
+                    ),
+                });
+            }
+        }
+        let action = HlExchangeAction::UpdateLeverage(HlUpdateLeverageAction {
+            asset: asset.asset_id,
+            is_cross: market.is_cross,
+            leverage: market.leverage,
+        });
+        let signed = self
+            .signer
+            .sign_action(
+                &action,
+                self.signer.next_nonce(),
+                None,
+                None,
+                self.network == HlNetwork::Mainnet,
+            )
+            .map_err(transport_error)?;
+        let raw = self
+            .ws
+            .post(serde_json::json!({
+                "type": "action",
+                "payload": signed.to_exchange_payload(),
+            }))
+            .await
+            .map_err(transport_error)?;
+        parse_default_action_response(raw)
+    }
+
+    pub fn calculate_order_size(
+        &self,
+        coin: &HlCoin,
+        request: HlSizingRequest,
+    ) -> Result<HlSizingResult, HlBrokerError> {
+        self.ensure_trading_state_fresh()?;
+        let account = self.account_state();
+        let asset = self
+            .metadata
+            .read()
+            .map_err(|_| HlBrokerError::StateUnavailable)?
+            .asset(coin)
+            .cloned()
+            .ok_or_else(|| HlBrokerError::InvalidRequest {
+                message: format!("unknown Hyperliquid coin {}", coin.0),
+            })?;
+        calculate_order_size(&account, &asset, request)
+    }
+
+    fn release_pending_notional(&self, client_order_id: &HlClientOrderId) {
+        if let Ok(mut pending) = self.pending_notional.lock() {
+            pending.remove(client_order_id);
+        }
+    }
 }
 
 fn current_millis() -> u64 {
@@ -501,6 +623,56 @@ fn normalize_order_precision(
         return Err("normalized order price must be positive".to_string());
     }
     Ok((normalized_size, normalized_price))
+}
+
+pub fn calculate_order_size(
+    account: &HlAccountState,
+    asset: &crate::hyperliquid::types::HlAssetMeta,
+    request: HlSizingRequest,
+) -> Result<HlSizingResult, HlBrokerError> {
+    if request.margin_fraction <= Decimal::ZERO || request.margin_fraction > Decimal::ONE {
+        return Err(HlBrokerError::InvalidRequest {
+            message: "margin fraction must be in (0, 1]".to_string(),
+        });
+    }
+    if request.leverage == 0 {
+        return Err(HlBrokerError::InvalidRequest {
+            message: "leverage must be positive".to_string(),
+        });
+    }
+    if let Some(max_leverage) = asset.max_leverage {
+        if request.leverage > max_leverage {
+            return Err(HlBrokerError::InvalidRequest {
+                message: format!(
+                    "leverage exceeds {} maximum of {max_leverage}",
+                    asset.coin.0
+                ),
+            });
+        }
+    }
+    if request.reference_price <= Decimal::ZERO || request.reserve_margin < Decimal::ZERO {
+        return Err(HlBrokerError::InvalidRequest {
+            message: "reference price must be positive and reserve margin non-negative".to_string(),
+        });
+    }
+    let available_margin =
+        (account.equity - account.margin_used - request.reserve_margin).max(Decimal::ZERO);
+    let margin = available_margin * request.margin_fraction;
+    let notional = margin * Decimal::from(request.leverage);
+    let size = (notional / request.reference_price)
+        .round_dp_with_strategy(asset.size_decimals, rust_decimal::RoundingStrategy::ToZero);
+    if size <= Decimal::ZERO {
+        return Err(HlBrokerError::InvalidRequest {
+            message: "sizing result is below the minimum quantity increment".to_string(),
+        });
+    }
+    Ok(HlSizingResult {
+        size,
+        margin,
+        notional: size * request.reference_price,
+        available_margin,
+        reference_price: request.reference_price,
+    })
 }
 
 fn push_bounded<T>(lock: &RwLock<Vec<T>>, value: T) -> Result<(), HlBrokerError> {
@@ -623,23 +795,46 @@ impl HyperliquidBroker for HyperliquidLiveBroker {
             normalize_order_precision(request.size, price, size_decimals)
                 .map_err(|message| HlBrokerError::InvalidRequest { message })?;
         request.size = normalized_size;
-        let (account, open_order_count) = {
+        let (account, state_open_orders) = {
             let state = self
                 .state
                 .read()
                 .map_err(|_| HlBrokerError::StateUnavailable)?;
-            (state.account.clone(), state.open_orders.len())
+            (state.account.clone(), state.open_orders.clone())
         };
-        let input = order_risk_input_at_price(
-            self.strategy_id.clone(),
-            &account,
-            &request,
-            price,
-            open_order_count,
-        );
-
-        if let RiskDecision::Rejected { violations } = self.risk_guard.check(&input) {
-            return Err(HlBrokerError::RiskRejected { violations });
+        let client_order_id = request
+            .client_order_id
+            .clone()
+            .expect("cloid generated above");
+        if !request.reduce_only {
+            let mut pending = self
+                .pending_notional
+                .lock()
+                .map_err(|_| HlBrokerError::StateUnavailable)?;
+            let input = order_risk_input_at_price(
+                self.strategy_id.clone(),
+                &account,
+                &request,
+                price,
+                &state_open_orders,
+                pending.values().copied().sum(),
+            );
+            if let RiskDecision::Rejected { violations } = self.risk_guard.check(&input) {
+                return Err(HlBrokerError::RiskRejected { violations });
+            }
+            pending.insert(client_order_id.clone(), input.order_notional);
+        } else {
+            let input = order_risk_input_at_price(
+                self.strategy_id.clone(),
+                &account,
+                &request,
+                price,
+                &state_open_orders,
+                Decimal::ZERO,
+            );
+            if let RiskDecision::Rejected { violations } = self.risk_guard.check(&input) {
+                return Err(HlBrokerError::RiskRejected { violations });
+            }
         }
         let signer = &self.signer;
         let ws = &self.ws;
@@ -648,17 +843,21 @@ impl HyperliquidBroker for HyperliquidLiveBroker {
         let expires_after = request
             .expires_after
             .map(|value| value.timestamp_millis() as u64);
-        let signed = signer
-            .sign_action(
-                &action,
-                nonce,
-                None,
-                expires_after,
-                self.network == HlNetwork::Mainnet,
-            )
-            .map_err(|error| HlBrokerError::Transport {
-                message: error.to_string(),
-            })?;
+        let signed = match signer.sign_action(
+            &action,
+            nonce,
+            None,
+            expires_after,
+            self.network == HlNetwork::Mainnet,
+        ) {
+            Ok(signed) => signed,
+            Err(error) => {
+                self.release_pending_notional(&client_order_id);
+                return Err(HlBrokerError::Transport {
+                    message: error.to_string(),
+                });
+            }
+        };
         let raw = ws
             .post(serde_json::json!({
                 "type": "action",
@@ -666,11 +865,9 @@ impl HyperliquidBroker for HyperliquidLiveBroker {
             }))
             .await
             .map_err(|_error| HlBrokerError::OutcomeUnknown {
-                client_order_id: request
-                    .client_order_id
-                    .clone()
-                    .expect("cloid generated above"),
+                client_order_id: client_order_id.clone(),
             })?;
+        self.release_pending_notional(&client_order_id);
         parse_order_result(
             raw,
             HlSubmittedOrder {
@@ -679,7 +876,7 @@ impl HyperliquidBroker for HyperliquidLiveBroker {
                 size: request.size,
                 limit_price: price,
                 reduce_only: request.reduce_only,
-                client_order_id: request.client_order_id.expect("cloid generated above"),
+                client_order_id,
             },
         )
     }
@@ -891,6 +1088,29 @@ fn parse_order_result(
     })
 }
 
+fn parse_default_action_response(raw: Value) -> Result<(), HlBrokerError> {
+    let payload = raw.pointer("/data/response/payload").unwrap_or(&raw);
+    if payload.get("status").and_then(Value::as_str) == Some("ok")
+        && payload.pointer("/response/type").and_then(Value::as_str) == Some("default")
+    {
+        return Ok(());
+    }
+    if payload.get("type").and_then(Value::as_str) == Some("error") {
+        return Err(HlBrokerError::ExchangeRejected {
+            message: payload
+                .get("payload")
+                .and_then(Value::as_str)
+                .unwrap_or("exchange action error")
+                .to_string(),
+            raw,
+        });
+    }
+    Err(HlBrokerError::ExchangeRejected {
+        message: "unexpected update leverage response".to_string(),
+        raw,
+    })
+}
+
 fn parse_cancel_response(raw: Value) -> Result<HlCancelResponse, HlBrokerError> {
     let statuses = raw
         .pointer("/data/response/payload/response/data/statuses")
@@ -1025,5 +1245,62 @@ mod tests {
         assert_eq!(fill.coin.as_deref(), Some("BTC"));
         assert_eq!(fill.size, Some("0.1".parse().unwrap()));
         assert_eq!(fill.raw, message);
+    }
+
+    #[test]
+    fn sizes_from_available_margin_and_rounds_down() {
+        let account = HlAccountState {
+            equity: "1000".parse().unwrap(),
+            margin_used: "100".parse().unwrap(),
+            positions: Vec::new(),
+        };
+        let asset = crate::hyperliquid::types::HlAssetMeta {
+            coin: HlCoin::new("BTC"),
+            asset_id: crate::hyperliquid::types::HlAssetId(0),
+            size_decimals: 3,
+            max_leverage: Some(10),
+            only_isolated: false,
+        };
+        let result = calculate_order_size(
+            &account,
+            &asset,
+            HlSizingRequest {
+                margin_fraction: "0.5".parse().unwrap(),
+                leverage: 5,
+                reserve_margin: "100".parse().unwrap(),
+                reference_price: "12345".parse().unwrap(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.available_margin, "800".parse().unwrap());
+        assert_eq!(result.margin, "400".parse().unwrap());
+        assert_eq!(result.size, "0.162".parse().unwrap());
+        assert_eq!(result.notional, "1999.89".parse().unwrap());
+    }
+
+    #[test]
+    fn parses_update_leverage_response() {
+        parse_default_action_response(serde_json::json!({
+            "status": "ok",
+            "response": {"type": "default"}
+        }))
+        .unwrap();
+    }
+
+    #[test]
+    fn parses_websocket_update_leverage_response() {
+        parse_default_action_response(serde_json::json!({
+            "channel": "post",
+            "data": {
+                "response": {
+                    "payload": {
+                        "status": "ok",
+                        "response": {"type": "default"}
+                    }
+                }
+            }
+        }))
+        .unwrap();
     }
 }

@@ -9,7 +9,7 @@ use serde::Serialize;
 
 use crate::hyperliquid::types::{
     HlCancelAction, HlCancelByCloidAction, HlExchangeAction, HlOrderAction, HlOrderType,
-    HlSignature, HlSignedAction, HlTriggerExecution,
+    HlSignature, HlSignedAction, HlTriggerExecution, HlUpdateLeverageAction,
 };
 
 sol! {
@@ -88,6 +88,16 @@ struct CancelWire {
 struct CancelByCloidWire {
     asset: u32,
     cloid: String,
+}
+
+#[derive(Serialize)]
+struct UpdateLeverageWire {
+    #[serde(rename = "type")]
+    action_type: &'static str,
+    asset: u32,
+    #[serde(rename = "isCross")]
+    is_cross: bool,
+    leverage: u32,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -211,6 +221,9 @@ fn action_msgpack(action: &HlExchangeAction) -> anyhow::Result<Vec<u8>> {
         HlExchangeAction::CancelByCloid(action) => {
             rmp_serde::to_vec_named(&cancel_by_cloid_action_wire(action)).map_err(Into::into)
         }
+        HlExchangeAction::UpdateLeverage(action) => {
+            rmp_serde::to_vec_named(&update_leverage_wire(action)).map_err(Into::into)
+        }
     }
 }
 
@@ -287,6 +300,15 @@ fn cancel_by_cloid_action_wire(action: &HlCancelByCloidAction) -> CancelByCloidA
             })
             .collect(),
         f: action.fast,
+    }
+}
+
+fn update_leverage_wire(action: &HlUpdateLeverageAction) -> UpdateLeverageWire {
+    UpdateLeverageWire {
+        action_type: "updateLeverage",
+        asset: action.asset.0,
+        is_cross: action.is_cross,
+        leverage: action.leverage,
     }
 }
 
