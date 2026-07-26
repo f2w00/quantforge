@@ -8,6 +8,8 @@ use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
+const POST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<anyhow::Result<Value>>>>>;
 
 #[derive(Clone)]
@@ -81,6 +83,13 @@ impl HyperliquidWsClient {
                         else => break,
                     }
                 }
+                if let Ok(mut map) = pending_reader.lock() {
+                    for (_, sender) in map.drain() {
+                        let _ = sender.send(Err(anyhow::anyhow!(
+                            "websocket connection closed before response",
+                        )));
+                    }
+                }
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
         });
@@ -152,6 +161,12 @@ impl HyperliquidWsClient {
             self.pending.lock().ok().and_then(|mut map| map.remove(&id));
             return Err(anyhow::anyhow!("websocket writer is closed"));
         }
-        receiver.await.context("receive websocket post response")?
+        match tokio::time::timeout(POST_TIMEOUT, receiver).await {
+            Ok(result) => result.context("receive websocket post response")?,
+            Err(_) => {
+                self.pending.lock().ok().and_then(|mut map| map.remove(&id));
+                Err(anyhow::anyhow!("websocket post response timeout"))
+            }
+        }
     }
 }

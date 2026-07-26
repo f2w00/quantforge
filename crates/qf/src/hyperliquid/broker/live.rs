@@ -67,11 +67,30 @@ pub struct HyperliquidLiveBroker {
     signer: std::sync::Arc<HyperliquidSigner>,
     ws: HyperliquidWsClient,
     network: HlNetwork,
-    order_updates: RwLock<Vec<Value>>,
-    fills: RwLock<Vec<Value>>,
+    order_updates: RwLock<Vec<HlOrderUpdate>>,
+    fills: RwLock<Vec<HlUserFill>>,
     account_address: String,
     freshness_max_age: std::time::Duration,
     freshness: RwLock<HlFreshness>,
+}
+
+#[derive(Clone, Debug)]
+pub struct HlOrderUpdate {
+    pub order_id: Option<String>,
+    pub client_order_id: Option<String>,
+    pub status: Option<String>,
+    pub raw: Value,
+}
+
+#[derive(Clone, Debug)]
+pub struct HlUserFill {
+    pub order_id: Option<String>,
+    pub client_order_id: Option<String>,
+    pub coin: Option<String>,
+    pub size: Option<crate::core::Decimal>,
+    pub price: Option<crate::core::Decimal>,
+    pub fee: Option<crate::core::Decimal>,
+    pub raw: Value,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -183,24 +202,48 @@ impl HyperliquidLiveBroker {
         mut events: mpsc::Receiver<Value>,
         timeout: std::time::Duration,
     ) -> Result<mpsc::Receiver<Value>, HlBrokerError> {
+        let expected = [
+            "allMids",
+            "clearinghouseState",
+            "openOrders",
+            "orderUpdates",
+            "userFills",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<std::collections::HashSet<_>>();
         let mut acknowledged = std::collections::HashSet::new();
         tokio::time::timeout(timeout, async {
-            while acknowledged.len() < 5 {
+            while acknowledged != expected {
                 let message = events
                     .recv()
                     .await
                     .ok_or_else(|| HlBrokerError::Transport {
                         message: "websocket closed before subscription confirmation".to_string(),
                     })?;
-                if message.get("channel").and_then(Value::as_str) == Some("subscriptionResponse") {
-                    if let Some(subscription_type) = message
-                        .pointer("/data/subscription/type")
-                        .and_then(Value::as_str)
-                    {
+                match message.get("channel").and_then(Value::as_str) {
+                    Some("subscriptionResponse") => {
+                        let subscription_type = message
+                            .pointer("/data/subscription/type")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| HlBrokerError::Transport {
+                                message: "invalid websocket subscription response".to_string(),
+                            })?;
+                        if !expected.contains(subscription_type) {
+                            return Err(HlBrokerError::Transport {
+                                message: format!(
+                                    "unexpected websocket subscription: {subscription_type}"
+                                ),
+                            });
+                        }
                         acknowledged.insert(subscription_type.to_string());
                     }
-                } else {
-                    self.apply_ws_event(message)?;
+                    Some("error") => {
+                        return Err(HlBrokerError::Transport {
+                            message: format!("websocket subscription error: {message}"),
+                        });
+                    }
+                    _ => self.apply_ws_event(message)?,
                 }
             }
             Ok::<(), HlBrokerError>(())
@@ -243,11 +286,15 @@ impl HyperliquidLiveBroker {
                 Ok(())
             }
             Some("orderUpdates") => {
-                push_bounded(&self.order_updates, message)?;
+                for value in event_values(&message) {
+                    push_bounded(&self.order_updates, parse_order_update(&message, value))?;
+                }
                 Ok(())
             }
             Some("userFills") => {
-                push_bounded(&self.fills, message)?;
+                for value in event_values(&message) {
+                    push_bounded(&self.fills, parse_user_fill(&message, value))?;
+                }
                 Ok(())
             }
             _ => Ok(()),
@@ -372,12 +419,16 @@ impl HyperliquidLiveBroker {
                         state.account = account;
                     }
                     let _ = self.mark_fresh(|freshness| freshness.account = Some(Utc::now()));
+                } else {
+                    let _ = self.mark_fresh(|freshness| freshness.account = None);
                 }
                 if let Ok(open_orders) = self.client.open_orders(&self.account_address).await {
                     if let Ok(mut state) = self.state.write() {
                         state.open_orders = open_orders;
                     }
                     let _ = self.mark_fresh(|freshness| freshness.open_orders = Some(Utc::now()));
+                } else {
+                    let _ = self.mark_fresh(|freshness| freshness.open_orders = None);
                 }
             }
         })
@@ -393,6 +444,13 @@ impl HyperliquidLiveBroker {
             .unwrap_or(now);
         HlClientOrderId::new(format!("0x{value:032x}"))
             .expect("generated client order id must be valid")
+    }
+
+    pub async fn order_status(&self, order_id_or_cloid: &str) -> Result<Value, HlBrokerError> {
+        self.client
+            .order_status(&self.account_address, order_id_or_cloid)
+            .await
+            .map_err(transport_error)
     }
 }
 
@@ -423,13 +481,82 @@ fn protected_price(
     }
 }
 
-fn push_bounded(lock: &RwLock<Vec<Value>>, value: Value) -> Result<(), HlBrokerError> {
+fn normalize_order_precision(
+    size: crate::core::Decimal,
+    price: crate::core::Decimal,
+    size_decimals: u32,
+) -> Result<(crate::core::Decimal, crate::core::Decimal), String> {
+    let normalized_size = size.round_dp(size_decimals);
+    let price_decimals = 6u32.saturating_sub(size_decimals);
+    let normalized_price = price
+        .round_sf(5)
+        .ok_or_else(|| "price cannot be normalized to five significant digits".to_string())?
+        .round_dp(price_decimals);
+    if normalized_size != size {
+        return Err(format!(
+            "order size must have at most {size_decimals} decimals"
+        ));
+    }
+    if normalized_price <= crate::core::Decimal::ZERO {
+        return Err("normalized order price must be positive".to_string());
+    }
+    Ok((normalized_size, normalized_price))
+}
+
+fn push_bounded<T>(lock: &RwLock<Vec<T>>, value: T) -> Result<(), HlBrokerError> {
     let mut values = lock.write().map_err(|_| HlBrokerError::StateUnavailable)?;
     if values.len() == ACCOUNT_EVENT_HISTORY_LIMIT {
         values.remove(0);
     }
     values.push(value);
     Ok(())
+}
+
+fn event_data(message: &Value) -> &Value {
+    message.get("data").unwrap_or(message)
+}
+
+fn event_values(message: &Value) -> Vec<&Value> {
+    match event_data(message) {
+        Value::Array(values) => values.iter().collect(),
+        value => vec![value],
+    }
+}
+
+fn string_field(value: &Value, names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| {
+        value.get(*name).and_then(|field| {
+            field
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| field.as_u64().map(|number| number.to_string()))
+        })
+    })
+}
+
+fn decimal_field(value: &Value, names: &[&str]) -> Option<crate::core::Decimal> {
+    string_field(value, names)?.parse().ok()
+}
+
+fn parse_order_update(message: &Value, value: &Value) -> HlOrderUpdate {
+    HlOrderUpdate {
+        order_id: string_field(value, &["oid", "orderId"]),
+        client_order_id: string_field(value, &["cloid", "clientOrderId"]),
+        status: string_field(value, &["status", "orderStatus"]),
+        raw: message.clone(),
+    }
+}
+
+fn parse_user_fill(message: &Value, value: &Value) -> HlUserFill {
+    HlUserFill {
+        order_id: string_field(value, &["oid", "orderId"]),
+        client_order_id: string_field(value, &["cloid", "clientOrderId"]),
+        coin: string_field(value, &["coin"]),
+        size: decimal_field(value, &["sz", "size"]),
+        price: decimal_field(value, &["px", "price"]),
+        fee: decimal_field(value, &["fee"]),
+        raw: message.clone(),
+    }
 }
 
 #[async_trait::async_trait]
@@ -492,16 +619,10 @@ impl HyperliquidBroker for HyperliquidLiveBroker {
         let (asset, size_decimals) = asset.ok_or_else(|| HlBrokerError::InvalidRequest {
             message: format!("unknown Hyperliquid coin {}", request.coin.0),
         })?;
-        if request.size.scale() > size_decimals {
-            return Err(HlBrokerError::InvalidRequest {
-                message: format!(
-                    "order size has {} decimals; {} allowed for {}",
-                    request.size.scale(),
-                    size_decimals,
-                    request.coin.0
-                ),
-            });
-        }
+        let (normalized_size, price) =
+            normalize_order_precision(request.size, price, size_decimals)
+                .map_err(|message| HlBrokerError::InvalidRequest { message })?;
+        request.size = normalized_size;
         let (account, open_order_count) = {
             let state = self
                 .state
@@ -870,5 +991,39 @@ mod tests {
         let result = parse_cancel_response(raw).unwrap();
         assert!(result.success);
         assert!(matches!(result.statuses[0], HlCancelStatus::Success));
+    }
+
+    #[test]
+    fn normalizes_hyperliquid_price_precision() {
+        let (_, price) =
+            normalize_order_precision("1.25".parse().unwrap(), "123.456789".parse().unwrap(), 3)
+                .unwrap();
+        assert_eq!(price, "123.46".parse().unwrap());
+    }
+
+    #[test]
+    fn rejects_size_beyond_metadata_precision() {
+        let result = normalize_order_precision("1.001".parse().unwrap(), "100".parse().unwrap(), 2);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn structures_fill_event_and_keeps_raw_payload() {
+        let message = serde_json::json!({
+            "channel": "userFills",
+            "data": {
+                "oid": 42,
+                "cloid": "0xabc",
+                "coin": "BTC",
+                "sz": "0.1",
+                "px": "100.5",
+                "fee": "0.01"
+            }
+        });
+        let fill = parse_user_fill(&message, event_data(&message));
+        assert_eq!(fill.order_id.as_deref(), Some("42"));
+        assert_eq!(fill.coin.as_deref(), Some("BTC"));
+        assert_eq!(fill.size, Some("0.1".parse().unwrap()));
+        assert_eq!(fill.raw, message);
     }
 }

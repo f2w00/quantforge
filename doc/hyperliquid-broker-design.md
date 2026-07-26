@@ -406,14 +406,14 @@ LiveBroker 的连接初始化计划为：
 
 尚未完成：
 
-- WS 自动重连、断线恢复和 REST reconciliation；
+- WS 断线恢复的完整请求状态语义和 REST reconciliation 失败诊断；
 - nonce manager；
-- REST exchange fallback；
+- 安全的 REST exchange fallback（需要区分未发送和结果未知）；
 - WS 自动重连、断线恢复和 LiveBroker 事件消费；
-- metadata 过期策略和完整精度规范化；
-- orderUpdates/userFills 的结构化审计和成交账本；
+- 结构化事件的持久化审计和成交账本；
 - 账户 WS 订阅和本地状态 reconciliation；
-- timeout、幂等查询、REST fallback 和 audit；
+- OutcomeUnknown 基于 cloid 的自动 orderStatus 对账；
+- 完整 timeout、幂等查询和 audit 测试；
 - PaperBroker。
 
 因此当前 `HyperliquidLiveBroker` 仍是接口适配层，尚不能真实下单。目标是先实现

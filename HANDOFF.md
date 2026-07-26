@@ -25,7 +25,7 @@ Objective
   - `orderUpdates`：订单生命周期事件
   - `userFills`：成交事件/明细
   - `allMids`：市场 mid
-- `orderUpdates` / `userFills` 当前暂存为最多 1000 条原始 `serde_json::Value`，尚未结构化为审计/成交账本。
+- `orderUpdates` / `userFills` 当前暂存为最多 1000 条带 raw payload 的结构化内存事件，尚未持久化为审计/成交账本。
 - 使用官方 Hyperliquid Python/Rust SDK 作为协议参考；官方 Rust SDK 自身使用 Alloy，但不直接引入。
 - 当前已提交 commit：
   ```text
@@ -53,16 +53,18 @@ Objective
   - `clearinghouseState` / `openOrders` 状态更新。
   - metadata 定时刷新。
   - 设计文档 `doc/hyperliquid-broker-design.md`。
-- 最近未提交改动中已实现：
-  - WS 基础自动重连循环，重连后重发已记录的 subscribe 消息。
-  - WS post 30 秒 timeout。
+- 最近一轮改动中已实现：
+  - WS supervisor 自动重连，重连后重发已记录的 subscribe 消息。
+  - WS 断线时结束 pending request，WS post 30 秒 timeout。
+  - 订阅 ACK 频道校验、错误响应处理和超时。
   - LiveBroker `HlFreshness` 及 metadata/mids/account/open_orders freshness 更新。
-  - 定时 REST reconciliation：刷新 account 和 open orders。
+  - 定时 REST reconciliation，失败时将对应账户/挂单 freshness 标记为不可用。
   - place/close 前 `ensure_trading_state_fresh()`。
-  - 下单数量 `size_decimals` 校验。
-  - Trigger Market/Limit 的 wire price 计算：
-    - Market：mid/trigger price + 方向性滑点保护。
-    - Limit：使用指定 limit price。
+  - 下单数量 `size_decimals` 严格校验。
+  - Hyperliquid 5 位有效数字和 perp price decimals 规范化。
+  - Trigger Market/Limit 的 wire price 计算。
+  - REST `orderStatus` 和 `/exchange` client 原语。
+  - `orderUpdates` / `userFills` 的基础结构化内存投影，并保留 raw payload。
 - 最近验证通过：
   ```text
   cargo fmt --all
@@ -74,22 +76,13 @@ Objective
   15 passed
   0 failed
   ```
-- 最近修改后仍未重新提交。
+- 最近一轮修改尚未提交。
 
 ### Active
 - 继续完成用户要求的“都实现”，重点剩余：
-  - 审查并收紧 WS supervisor/reconnect 设计。
-  - 确保断线时 pending request 正确结束为 `Transport` 或 `OutcomeUnknown`。
-  - 完善订阅 ACK 的错误解析和超时。
-  - 完善 REST reconciliation 的 freshness 标记和失败策略。
-  - 实现完整 price/size precision normalization：
-    - size decimals 严格校验或明确量化策略。
-    - Hyperliquid 5 位有效数字。
-    - perp price decimals `<= 6 - szDecimals`。
-    - 去除尾零。
-  - 结构化 `orderUpdates` / `userFills` 事件。
-  - 实现 REST `/exchange` fallback。
-  - 实现 `OutcomeUnknown` 后基于 cloid 的 order status reconciliation。
+  - 实现 `OutcomeUnknown` 后基于 cloid 的自动 order status reconciliation。
+  - 为结构化事件增加持久化审计和成交账本。
+  - 明确区分 WS 未发送失败与已发送但响应未知，之后再安全接入 REST `/exchange` fallback。
   - 继续补充测试和更新文档。
 - 当前代码中新增的 `HlLiveBrokerConfig` 字段：
   ```rust
@@ -113,15 +106,15 @@ Objective
 - 没有当前编译或测试失败。
 - 尚未有真实 testnet 集成测试；不能宣称真实下单链路已在交易所验证。
 - WS 自动重连实现仍需审查：当前 `HyperliquidWsClient::connect()` 内部 supervisor 同时处理 outbound、inbound 和订阅重发，断线 pending request 的语义需要进一步确认。
-- 当前订阅 ACK 只按 `/data/subscription/type` 计数，没有严格判断 ACK 是否表示错误。
-- REST reconciliation 失败目前静默保留旧状态，尚未完整实现 stale/不可用状态传播。
-- `orderUpdates` / `userFills` 仍是原始事件，不支持结构化成交账本、手续费、realized PnL 审计。
-- REST `/exchange`、`orderStatus` 查询尚未实现，因此 `OutcomeUnknown` 还不能自动对账。
+- REST reconciliation 失败已传播为对应 freshness 不可用，但尚未记录失败原因和连续失败次数。
+- `orderUpdates` / `userFills` 已有基础结构化投影，但尚不支持持久化成交账本、完整手续费和 realized PnL 审计。
+- REST `/exchange`、`orderStatus` 原语已实现；`OutcomeUnknown` 尚未自动按 cloid 对账。
 - subaccount/vault 明确暂不实现。
 
 ## Next Move
-1. 审查并修正 `crates/qf/src/hyperliquid/client/ws.rs` 的 reconnect/pending request/订阅 ACK 语义，补断线和 timeout 测试。
-2. 实现 REST reconciliation freshness 失败处理、结构化 `orderUpdates/userFills`、精度规范化和 `orderStatus`/REST fallback，然后运行 `cargo fmt --all`、`cargo test --workspace`、`cargo check --workspace` 并提交本轮改动。
+1. 为 `OutcomeUnknown` 增加基于 cloid 的 orderStatus 查询和恢复状态机。
+2. 增加 REST/WS 失败语义测试、精度规范化测试和结构化事件测试。
+3. 设计并接入持久化订单事件/成交账本，然后运行 `cargo fmt --all`、`cargo test --workspace`、`cargo check --workspace` 并提交。
 
 ## Relevant Files
 - `crates/qf/src/hyperliquid/broker/live.rs`: `HyperliquidLiveBroker`、`HlLiveBrokerConfig`、`HlNetwork`、`connect()`、freshness、reconciliation、WS 事件消费、place/cancel。

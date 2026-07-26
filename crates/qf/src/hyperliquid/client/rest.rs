@@ -60,6 +60,28 @@ impl HyperliquidRestClient {
         response.into_iter().map(TryInto::try_into).collect()
     }
 
+    pub async fn order_status(&self, user: &str, oid: &str) -> anyhow::Result<serde_json::Value> {
+        self.info(serde_json::json!({
+            "type": "orderStatus",
+            "user": user,
+            "oid": oid,
+        }))
+        .await
+    }
+
+    pub async fn exchange(&self, payload: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let url = format!("{}/exchange", self.base_url.trim_end_matches('/'));
+        Ok(self
+            .client
+            .post(url)
+            .json(&payload)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
     async fn info<T: serde::de::DeserializeOwned>(
         &self,
         request: serde_json::Value,
