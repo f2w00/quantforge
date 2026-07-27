@@ -28,8 +28,12 @@ struct HyperliquidBacktestInner {
     initial_equity: Decimal,
     realized_pnl: Decimal,
     trading_fees: Decimal,
+    funding_pnl: Decimal,
+    last_funding_at: HashMap<HlCoin, chrono::DateTime<chrono::Utc>>,
     market_slippage_bps: u32,
     taker_fee_bps: u32,
+    maintenance_margin_bps: u32,
+    liquidation_count: u64,
     next_order_id: u64,
 }
 
@@ -46,8 +50,12 @@ impl HyperliquidBacktestBroker {
                 initial_equity,
                 realized_pnl: Decimal::ZERO,
                 trading_fees: Decimal::ZERO,
+                funding_pnl: Decimal::ZERO,
+                last_funding_at: HashMap::new(),
                 market_slippage_bps: 0,
                 taker_fee_bps: 0,
+                maintenance_margin_bps: 500,
+                liquidation_count: 0,
                 next_order_id: 1,
             }),
         }
@@ -63,6 +71,7 @@ impl HyperliquidBacktestBroker {
             .map_err(|_| HlBrokerError::StateUnavailable)?;
         inner.mark_prices.insert(coin, price);
         inner.revalue_account();
+        inner.liquidate_if_needed();
         Ok(())
     }
 
@@ -79,6 +88,7 @@ impl HyperliquidBacktestBroker {
             position.leverage = Decimal::from(leverage);
         }
         inner.revalue_account();
+        inner.liquidate_if_needed();
         Ok(())
     }
 
@@ -100,6 +110,54 @@ impl HyperliquidBacktestBroker {
         Ok(())
     }
 
+    pub fn set_maintenance_margin_bps(&self, bps: u32) -> Result<(), HlBrokerError> {
+        validate_bps(bps, "maintenance margin")?;
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| HlBrokerError::StateUnavailable)?;
+        inner.maintenance_margin_bps = bps;
+        inner.liquidate_if_needed();
+        Ok(())
+    }
+
+    pub fn apply_funding(
+        &self,
+        coin: HlCoin,
+        funding_rate: Decimal,
+        settlement_price: Decimal,
+        settled_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Decimal, HlBrokerError> {
+        if settlement_price <= Decimal::ZERO {
+            return Err(invalid_request("funding settlement price must be positive"));
+        }
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| HlBrokerError::StateUnavailable)?;
+        if inner
+            .last_funding_at
+            .get(&coin)
+            .is_some_and(|last_settled_at| *last_settled_at >= settled_at)
+        {
+            return Err(invalid_request(
+                "funding settlement must be newer than the previous settlement",
+            ));
+        }
+        let funding_cashflow = inner
+            .state
+            .account
+            .positions
+            .get(&coin)
+            .map(|position| -position.size * settlement_price * funding_rate)
+            .unwrap_or(Decimal::ZERO);
+        inner.funding_pnl += funding_cashflow;
+        inner.last_funding_at.insert(coin, settled_at);
+        inner.revalue_account();
+        inner.liquidate_if_needed();
+        Ok(funding_cashflow)
+    }
+
     pub fn realized_pnl(&self) -> Decimal {
         self.inner
             .lock()
@@ -119,6 +177,20 @@ impl HyperliquidBacktestBroker {
             .lock()
             .map(|inner| inner.trading_fees)
             .unwrap_or(Decimal::ZERO)
+    }
+
+    pub fn funding_pnl(&self) -> Decimal {
+        self.inner
+            .lock()
+            .map(|inner| inner.funding_pnl)
+            .unwrap_or(Decimal::ZERO)
+    }
+
+    pub fn liquidation_count(&self) -> u64 {
+        self.inner
+            .lock()
+            .map(|inner| inner.liquidation_count)
+            .unwrap_or(0)
     }
 }
 
@@ -157,8 +229,9 @@ impl HyperliquidBacktestInner {
             }
         }
 
-        self.state.account.equity =
-            self.initial_equity + self.realized_pnl + self.unrealized_pnl() - self.trading_fees;
+        self.state.account.equity = self.initial_equity + self.realized_pnl + self.unrealized_pnl()
+            - self.trading_fees
+            + self.funding_pnl;
         self.state.account.margin_used = self
             .state
             .account
@@ -168,9 +241,42 @@ impl HyperliquidBacktestInner {
             .map(|position| position.notional / position.leverage)
             .sum();
         self.state.account.updated_at = chrono::Utc::now();
+    }
 
-        // TODO: 回测 replay 应在每个 Hyperliquid funding 结算时刻调用显式结算方法，
-        // 使用历史 funding rate 与结算价格更新权益并记录可审计账本，避免从价格数据推导。
+    fn liquidate_if_needed(&mut self) {
+        if self.maintenance_margin_bps == 0 || self.state.account.positions.is_empty() {
+            return;
+        }
+        let positions = self
+            .state
+            .account
+            .positions
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        if positions
+            .iter()
+            .any(|position| !self.mark_prices.contains_key(&position.coin))
+        {
+            return;
+        }
+        let maintenance_margin: Decimal = positions
+            .iter()
+            .map(|position| position.notional * bps_to_rate(self.maintenance_margin_bps))
+            .sum();
+        if self.state.account.equity > maintenance_margin {
+            return;
+        }
+
+        // 简化的组合保证金模型：触发后按当前 mark 平掉全部已定价仓位。
+        for position in positions {
+            let mark_price = self.mark_prices[&position.coin];
+            let entry_price = position.entry_price.unwrap_or(mark_price);
+            self.realized_pnl += (mark_price - entry_price) * position.size;
+        }
+        self.state.account.positions.clear();
+        self.liquidation_count += 1;
+        self.revalue_account();
     }
 
     fn fill_market_order(
@@ -269,6 +375,7 @@ impl HyperliquidBacktestInner {
 
         self.trading_fees += fill_size.abs() * fill_price * bps_to_rate(self.taker_fee_bps);
         self.revalue_account();
+        self.liquidate_if_needed();
         Ok(fill_size.abs())
     }
 }
@@ -816,6 +923,52 @@ mod tests {
 
         assert!(error.to_string().contains("insufficient equity"));
         assert!(broker.position(&coin).is_none());
+    }
+
+    #[tokio::test]
+    async fn applies_funding_as_a_directional_cashflow_once_per_settlement() {
+        let coin = HlCoin::new("BTC");
+        let broker = broker();
+        broker.set_mark_price(coin.clone(), decimal("100")).unwrap();
+        broker
+            .place_order(market_order(&coin, Side::Buy, "2"))
+            .await
+            .unwrap();
+        let settled_at = chrono::Utc::now();
+
+        let cashflow = broker
+            .apply_funding(coin.clone(), decimal("0.001"), decimal("100"), settled_at)
+            .unwrap();
+
+        assert_eq!(cashflow, decimal("-0.2"));
+        assert_eq!(broker.funding_pnl(), decimal("-0.2"));
+        assert_eq!(broker.account_state().unwrap().equity, decimal("999.8"));
+        assert!(
+            broker
+                .apply_funding(coin, decimal("0.001"), decimal("100"), settled_at)
+                .unwrap_err()
+                .to_string()
+                .contains("must be newer")
+        );
+    }
+
+    #[tokio::test]
+    async fn liquidates_all_positions_when_equity_reaches_maintenance_margin() {
+        let coin = HlCoin::new("BTC");
+        let broker = broker();
+        broker.set_mark_price(coin.clone(), decimal("100")).unwrap();
+        broker.set_leverage(coin.clone(), 10).unwrap();
+        broker
+            .place_order(market_order(&coin, Side::Buy, "100"))
+            .await
+            .unwrap();
+
+        broker.set_mark_price(coin.clone(), decimal("10")).unwrap();
+
+        assert!(broker.position(&coin).is_none());
+        assert_eq!(broker.liquidation_count(), 1);
+        assert_eq!(broker.realized_pnl(), decimal("-9000"));
+        assert_eq!(broker.account_state().unwrap().margin_used, Decimal::ZERO);
     }
 
     #[tokio::test]
