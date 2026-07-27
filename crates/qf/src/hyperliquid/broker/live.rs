@@ -162,6 +162,19 @@ impl HyperliquidLiveBroker {
         }
         let client = HyperliquidRestClient::new(config.network.rest_url());
         let user = format!("{:#x}", config.account_address);
+        let signer_address = format!("{:#x}", signer.wallet_address());
+        let agent_owner = client
+            .agent_owner(&signer_address)
+            .await
+            .map_err(transport_error)?;
+        if agent_owner != config.account_address {
+            return Err(HlBrokerError::InvalidRequest {
+                message: format!(
+                    "API wallet {signer_address} is authorized for {agent_owner:#x}, not \
+                     configured account {user}"
+                ),
+            });
+        }
         let metadata = client.meta().await.map_err(transport_error)?;
         let mids = client.all_mids().await.map_err(transport_error)?;
         let account = client
@@ -916,11 +929,11 @@ fn order_update_state(status: &str) -> Option<HlTrackedOrderState> {
 
 #[async_trait::async_trait]
 impl HyperliquidBroker for HyperliquidLiveBroker {
-    fn account_state(&self) -> HlAccountState {
+    fn account_state(&self) -> Result<HlAccountState, HlBrokerError> {
         self.state
             .read()
             .map(|state| state.account.clone())
-            .unwrap_or_default()
+            .map_err(|_| HlBrokerError::StateUnavailable)
     }
 
     fn open_orders(&self) -> Vec<HlOpenOrder> {
@@ -998,7 +1011,7 @@ impl HyperliquidBroker for HyperliquidLiveBroker {
                     }
                 })?;
                 resolve_margin_fraction_size(
-                    &self.account_state(),
+                    &self.account_state()?,
                     price,
                     size_decimals,
                     market.leverage,
@@ -1523,7 +1536,7 @@ mod tests {
             equity: "1000".parse().unwrap(),
             margin_used: "100".parse().unwrap(),
             positions: HashMap::new(),
-            updated_at: None,
+            updated_at: Utc::now(),
         };
         let size = resolve_margin_fraction_size(
             &account,

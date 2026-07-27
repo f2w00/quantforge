@@ -256,11 +256,11 @@ fn invalid_request(message: impl Into<String>) -> HlBrokerError {
 
 #[async_trait::async_trait]
 impl HyperliquidBroker for HyperliquidBacktestBroker {
-    fn account_state(&self) -> HlAccountState {
+    fn account_state(&self) -> Result<HlAccountState, HlBrokerError> {
         self.inner
             .lock()
             .map(|inner| inner.state.account.clone())
-            .unwrap_or_default()
+            .map_err(|_| HlBrokerError::StateUnavailable)
     }
 
     fn open_orders(&self) -> Vec<HlOpenOrder> {
@@ -421,7 +421,7 @@ mod tests {
                     equity: decimal("1000"),
                     margin_used: Decimal::ZERO,
                     positions: HashMap::new(),
-                    updated_at: None,
+                    updated_at: chrono::Utc::now(),
                 },
                 open_orders: Vec::new(),
             },
@@ -496,7 +496,7 @@ mod tests {
 
         assert_eq!(broker.realized_pnl(), decimal("20"));
         assert_eq!(broker.unrealized_pnl(), decimal("20"));
-        assert_eq!(broker.account_state().equity, decimal("1040"));
+        assert_eq!(broker.account_state().unwrap().equity, decimal("1040"));
     }
 
     #[tokio::test]
@@ -523,7 +523,7 @@ mod tests {
 
         assert!(broker.position(&coin).is_none());
         assert_eq!(broker.realized_pnl(), decimal("50"));
-        assert_eq!(broker.account_state().equity, decimal("1050"));
+        assert_eq!(broker.account_state().unwrap().equity, decimal("1050"));
     }
 
     #[tokio::test]

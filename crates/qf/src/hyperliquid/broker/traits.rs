@@ -12,7 +12,7 @@ use super::HlBrokerError;
 #[async_trait::async_trait]
 pub trait HyperliquidBroker: Send + Sync {
     /// 返回 broker 当前维护的本地账户快照，不主动发起远端同步。
-    fn account_state(&self) -> HlAccountState;
+    fn account_state(&self) -> Result<HlAccountState, HlBrokerError>;
 
     /// 返回账户级本地 open order 快照。
     fn open_orders(&self) -> Vec<HlOpenOrder>;
@@ -30,7 +30,7 @@ pub trait HyperliquidBroker: Send + Sync {
 
     /// 返回指定 coin 的本地仓位快照。
     fn position(&self, coin: &HlCoin) -> Option<HlPosition> {
-        self.account_state().positions.get(coin).cloned()
+        self.account_state().ok()?.positions.get(coin).cloned()
     }
 
     /// 返回指定 coin 的本地 open order 快照。

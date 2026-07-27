@@ -1,6 +1,6 @@
 use crate::hyperliquid::types::{HlAccountState, HlCoin, HlOpenOrder, HlPosition};
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct HlBrokerState {
     pub account: HlAccountState,
     pub open_orders: Vec<HlOpenOrder>,

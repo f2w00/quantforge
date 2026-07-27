@@ -105,7 +105,7 @@ mod tests {
                     liquidation_price: None,
                 },
             )]),
-            updated_at: None,
+            updated_at: chrono::Utc::now(),
         };
         let request = HlOrderRequest {
             coin: HlCoin::new("BTC"),

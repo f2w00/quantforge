@@ -69,6 +69,16 @@ impl HyperliquidRestClient {
         .await
     }
 
+    pub async fn agent_owner(&self, agent: &str) -> anyhow::Result<alloy::primitives::Address> {
+        let response: UserRoleWire = self
+            .info(serde_json::json!({
+                "type": "userRole",
+                "user": agent,
+            }))
+            .await?;
+        parse_agent_owner(agent, response)
+    }
+
     pub async fn exchange(&self, payload: serde_json::Value) -> anyhow::Result<serde_json::Value> {
         let url = format!("{}/exchange", self.base_url.trim_end_matches('/'));
         Ok(self
@@ -97,6 +107,33 @@ impl HyperliquidRestClient {
             .json()
             .await?)
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct UserRoleWire {
+    role: String,
+    data: Option<UserRoleDataWire>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UserRoleDataWire {
+    user: String,
+}
+
+fn parse_agent_owner(
+    agent: &str,
+    response: UserRoleWire,
+) -> anyhow::Result<alloy::primitives::Address> {
+    if response.role != "agent" {
+        anyhow::bail!(
+            "signer {agent} is not an API wallet (role: {})",
+            response.role
+        );
+    }
+    response
+        .data
+        .and_then(|data| data.user.parse().ok())
+        .ok_or_else(|| anyhow::anyhow!("API wallet {agent} has no valid owner"))
 }
 
 #[derive(Debug, Deserialize)]
@@ -172,8 +209,7 @@ impl TryFrom<ClearinghouseStateWire> for HlAccountState {
             updated_at: Utc
                 .timestamp_millis_opt(value.time)
                 .single()
-                .ok_or_else(|| anyhow::anyhow!("invalid clearinghouseState timestamp"))
-                .map(Some)?,
+                .ok_or_else(|| anyhow::anyhow!("invalid clearinghouseState timestamp"))?,
         })
     }
 }
@@ -244,6 +280,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn accepts_agent_role_and_returns_owner() {
+        let owner = parse_agent_owner(
+            "0x0000000000000000000000000000000000000001",
+            UserRoleWire {
+                role: "agent".to_string(),
+                data: Some(UserRoleDataWire {
+                    user: "0x0000000000000000000000000000000000000002".to_string(),
+                }),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            owner,
+            "0x0000000000000000000000000000000000000002"
+                .parse::<alloy::primitives::Address>()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn rejects_non_agent_role() {
+        let error = parse_agent_owner(
+            "0x0000000000000000000000000000000000000001",
+            UserRoleWire {
+                role: "user".to_string(),
+                data: None,
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("not an API wallet"));
+    }
+
+    #[test]
     fn parses_clearinghouse_snapshot() {
         let message = serde_json::json!({
             "data": {
@@ -275,10 +344,7 @@ mod tests {
         assert_eq!(position.size, "0.1".parse().unwrap());
         assert_eq!(position.unrealized_pnl, "10".parse().unwrap());
         assert_eq!(position.return_on_equity, "0.01".parse().unwrap());
-        assert_eq!(
-            account.updated_at.unwrap().timestamp_millis(),
-            1_700_000_000_000
-        );
+        assert_eq!(account.updated_at.timestamp_millis(), 1_700_000_000_000);
     }
 
     #[test]
