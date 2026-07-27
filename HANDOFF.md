@@ -1,242 +1,102 @@
-# 跨模式绩效报告实现交接
+# 跨模式账本与绩效报告交接
 
 ## 目标
 
-实现跨模式的交易账本与绩效报告能力，供 `Backtest`、`Paper`、`Live` 统一使用。
+`Backtest`、`Paper`、`Live` 产生同格式的账本事实；`performance` 仅消费账本事件或其持久化回放结果计算报告。不要创建 backtest 专用 report。
 
-不要创建 backtest 专用的 report。回测和实盘应产生同格式的账本事件；报告层从
-账本事件流或其 JSONL 持久化结果计算指标。
+## 当前已实现
 
-## 已确认的职责边界
+### 账本与审计边界
 
-```text
-HyperliquidBacktestBroker / HyperliquidLiveBroker
-  -> 产生结构化账本事件
-  -> audit 持久化不可变事实（JSONL）
+- `AuditEvent` 是可丢失的操作诊断日志；`RunJournal` 统一填充 `journal_id` 与本地 `record_at`。
+- 调用方传入 `AuditRecord`：策略、模式、交易所、动作、可选标的和自由格式的脱敏 `data`。不得在 `data` 写入签名 payload、nonce 或授权材料。
+- `LedgerEvent` 位于 `crates/qf/src/audit/ledger.rs`，是可移植的不可变经济事实，包含稳定 `event_id`、`strategy_id`、模式、交易所和事件时间；不携带存储归档用的 `journal_id`。
+- `LedgerEventKind` 已实现：`Fill`、`Funding`、`Liquidation`、`EquitySnapshot`。
+- `Fill.fee` 与 `Liquidation.fee` 为 `Option<Decimal>`；实盘字段缺失必须保留 `None`，不能伪造为零。
+- `Funding`、`Liquidation` 与 `EquitySnapshot` 中实盘未可靠提供的派生字段同样使用 `Option`；`Some(Decimal::ZERO)` 仅表示来源明确确认该值为零。
+- `event_id` 是来源经济事实的稳定 ID：实盘优先使用交易所事实 ID；回测没有来源 ID 时使用 `bt-<journal_id>-<sequence>`。
+- 派生指标不写入账本。
 
-performance
-  -> 消费账本事件
-  -> 增量统计或回放历史 JSONL
-  -> 输出 PerformanceReport
-```
+### 运行级记录入口
 
-- `audit`：记录事实，不负责指标公式。
-- `performance`：纯指标计算，不依赖 Hyperliquid Broker。
-- Broker：成交、资金费、清算与权益变动发生时发出账本事件。
-- 现有 `AuditEvent` 保持其操作审计用途，不应硬塞成交与权益统计字段。
+- `RunJournal` 位于 `crates/qf/src/audit/recorder.rs`，包含 `JournalId`、必需账本 sink 和可选操作审计 sink。
+- `JournalId` 标识持久化记录集合：回测通常每次创建一个，Live 可跨进程重启稳定地关联同一策略的全部记录。
+- Broker 仅持有 `Arc<RunJournal>`，调用 `record_ledger` 或 `record_audit`，不依赖 JSONL、路径、队列或数据库。
+- `audit` 不依赖 `storage`。
 
-## 当前代码状态
+### 存储实现
 
-### 已有 audit
+- `storage::JsonlAuditSink` 与 `JsonlLedgerSink` 是同步 JSONL 实现。
+- `storage::JsonlReader` 支持泛型 JSONL 回放。
+- `storage::JsonlLedgerReader` 是 Ledger 的专用读取入口；`JournalPaths::ledger_path()`
+  定位单个 journal 的 `ledger.jsonl`。
+- `storage::AsyncAuditSink` 与 `AsyncLedgerSink` 是任意 sink 的有界异步包装：调用侧使用 `try_send`，队列满或后台退出时丢弃并计数；后台写入失败同样计数。
+- `AsyncSinkStatus` 提供 `accepted`、`dropped`、`write_failures`；调用 `shutdown()` 可排空已入队事件。
+- 异步不是强制默认。是否异步由运行装配层注入 `RunJournal` 的 sink 决定；裸 `Jsonl*Sink` 会同步写入。
+- 当前没有 `StorageConfig`、CLI、`BacktestRunner` 或应用启动层，因此仓库内部尚无“选择 JSONL / 数据库 / 队列”的配置工厂。
 
-- `crates/qf/src/audit/event.rs`
-  - `AuditEvent` 只记录操作请求、风控决定、原始响应、错误和时间。
-  - `AuditAction` 当前包含下单、撤单、修改、平仓、同步状态。
-- `crates/qf/src/audit/recorder.rs`
-  - `AuditRecorder<S: AuditSink>` 仅将 `AuditEvent` 写入 sink。
-- `crates/qf/src/audit/sink.rs`
-  - `AuditSink` 当前只接收 `AuditEvent`。
-  - `JsonlAuditSink` 用 `JsonlWriter` 持久化。
-- `crates/qf/src/storage/jsonl.rs`
-  - 只有 append writer，没有 JSONL reader。
+### 回测 Broker
 
-### 已有回测 Broker
+- `HyperliquidBacktestBroker::new` 已强制接收 `Arc<RunJournal>`，不再有无账本构造路径。
+- 成功市价成交后发出 `Fill` 和 `EquitySnapshot`。
+- `apply_funding` 后发出 `Funding`、可能的 `Liquidation` 和 `EquitySnapshot`。
+- 标记价格、杠杆或维持保证金变更后发出可能的 `Liquidation` 与 `EquitySnapshot`。
+- 清算按标的记录数量、价格、已实现损益和 `maintenance_margin_breach` 原因。
+- 回测事件 ID 为 `bt-<journal_id>-<sequence>`；其 `journal_id` 仅参与生成模拟来源 ID，不写入 ledger 事件字段。
+- 事件在账户状态锁释放后写入 `RunJournal`；若注入 `AsyncLedgerSink`，不会阻塞 Broker 调用路径。
+- 回测快照大多仍使用墙钟 `Utc::now()`；仅 funding 使用调用方提供的结算时间。可复现回放仍需后续从行情/replay 层传入事件时间。
 
-`crates/qf/src/hyperliquid/broker/backtest.rs` 已支持：
+### 实盘 Broker
 
-- market order 全额成交；
-- 确定性不利滑点：`set_market_slippage_bps`；
-- taker 手续费：`set_taker_fee_bps`；
-- 杠杆、初始保证金校验、仓位/账户重估；
-- funding：`apply_funding(coin, funding_rate, settlement_price, settled_at)`；
-- 简化组合维持保证金清算：`set_maintenance_margin_bps`，默认 500 bps；
-- 可读累计值：`realized_pnl`、`unrealized_pnl`、`trading_fees`、`funding_pnl`、
-  `liquidation_count`。
+- `HyperliquidLiveBroker::connect` 接收共享 `Arc<RunJournal>`；`JournalId` 由运行装配层选择，而不应由交易所提供。
+- 下单、撤单、平仓、杠杆设置与账户/挂单 reconciliation 失败会记录 audit。正常高频 WS 更新不会写入 audit。
+- Live audit 只记录请求已接受、明确拒绝、失败或结果未知等本地诊断结果；不代表成交。
+- 后续只可由交易所确认的 `userFills` 生成 `Fill`，不得以订单请求成功代替成交。
+- 账户 WS 快照或 reconciliation 生成 `EquitySnapshot`；资金费与清算必须来自可靠交易所数据。
 
-回测 Broker 当前尚未输出逐笔成交、funding、清算或权益快照账本。
+### 绩效模块
 
-### 已有实盘 Broker
+- `performance::PerformanceReport::from_events` 是只读账本投影：按事件时间排序、按
+  `event_id` 去重，回放 `Fill`、`Funding`、`Liquidation` 与 `EquitySnapshot`。
+- 报告包含权益收益、已实现/未实现 PnL、费用、资金费、完整持仓生命周期口径的胜率、
+  Profit Factor、Expectancy、最大回撤、清算数和数据质量。
+- `JsonlLedgerReader::read_all(paths.ledger_path())` 可读取单个 journal 的 JSONL 账本并传入
+  `PerformanceReport::from_events`。Ledger 不分段，读取器当前一次性加载文件。
+- `PerformanceReport::to_markdown()` 用于人类阅读；`to_pretty_json()` 保持数值类型并可反序列化
+  回 `PerformanceReport`，适合后续计算输入。
+- 详细设计见 `doc/performance-design.md`。
 
-`crates/qf/src/hyperliquid/broker/live.rs` 已维护 WS 订单更新和 `userFills` 的有限内存历史。
-后续应从交易所确认的 fills、账户快照和 funding 数据产生相同的账本事件。
-不要将“下单请求已发送”错误地记录为成交。
+## 运行装配示例
 
-### 核心类型
-
-- `RunMode`：`crates/qf/src/core/mode.rs`，含 `Backtest`、`Paper`、`Live`。
-- `RunId`、`StrategyId`：`crates/qf/src/core/id.rs`。
-- `Timestamp`：`crates/qf/src/core/time.rs`，即 `chrono::DateTime<Utc>`。
-- 公共 Decimal：`crate::core::Decimal`。
-
-## 推荐实现范围
-
-同时实现内存增量统计与 JSONL 回放：
-
-1. 新增 `audit::LedgerEvent`，并持久化到 JSONL。
-2. 新增独立 `performance` 模块，其输入仅为账本事件。
-3. `PerformanceTracker` 支持增量消费事件并生成报告。
-4. JSONL reader 支持读取历史账本并重建同一 `PerformanceReport`。
-5. 回测 Broker 发出账本事件；实盘接入留出明确入口，至少不要阻碍后续接入。
-
-## 推荐文件结构
-
-```text
-crates/qf/src/
-├── audit/
-│   ├── event.rs          # 既有操作审计，尽量不改语义
-│   ├── ledger.rs         # 新增 LedgerEvent 及具体 payload
-│   ├── recorder.rs       # 按需扩展账本记录入口
-│   └── sink.rs           # 按需扩展或新增 LedgerSink
-├── performance/
-│   ├── mod.rs
-│   ├── tracker.rs        # PerformanceTracker：增量状态机
-│   ├── report.rs         # PerformanceReport 及公开数据结构
-│   └── metrics.rs        # 无副作用的统计计算
-└── storage/
-    └── jsonl.rs          # 增加 reader，或新增专用 reader 文件
-```
-
-## LedgerEvent 建议
-
-建议 event envelope 包含：
+运行层应选择具体存储实现，再创建共享记录入口：
 
 ```rust
-pub struct LedgerEvent {
-    pub run_id: RunId,
-    pub strategy_id: StrategyId,
-    pub mode: RunMode,
-    pub exchange: String,
-    pub timestamp: Timestamp,
-    pub event: LedgerEventKind,
-}
+let paths = JournalPaths::new(storage_root, journal_id.clone());
+let writer = JsonlWriter::create(paths.ledger_path())?;
+let ledger = AsyncLedgerSink::new(JsonlLedgerSink::new(writer), 4_096);
+let journal = Arc::new(RunJournal::new(journal_id, ledger));
+
+let broker = HyperliquidBacktestBroker::new(
+    strategy_id,
+    initial_state,
+    risk_guard,
+    Arc::clone(&journal),
+);
 ```
 
-`LedgerEventKind` 至少包括：
+运行结束时，装配层必须持有异步 sink 的生命周期并调用 `shutdown()`；当前 `RunJournal` 不提供该能力，未来应增加运行资源/运行器对象统一管理。
 
-```rust
-pub enum LedgerEventKind {
-    Fill {
-        order_id: Option<String>,
-        client_order_id: Option<String>,
-        symbol: String,
-        side: Side,
-        size: Decimal,
-        price: Decimal,
-        fee: Decimal,
-        reduce_only: bool,
-    },
-    Funding {
-        symbol: String,
-        funding_rate: Decimal,
-        settlement_price: Decimal,
-        cashflow: Decimal,
-    },
-    Liquidation {
-        symbol: Option<String>,
-        realized_pnl: Decimal,
-        reason: String,
-    },
-    EquitySnapshot {
-        equity: Decimal,
-        margin_used: Decimal,
-        realized_pnl: Decimal,
-        unrealized_pnl: Decimal,
-        trading_fees: Decimal,
-        funding_pnl: Decimal,
-    },
-}
-```
+## 下一步
 
-字段可按现有类型和实际可获取数据微调，但应保留以下事实：
+1. 新增运行装配层和 `StorageConfig`，统一创建 JSONL/异步 sink、保留 sink 状态和 shutdown 生命周期。
+2. 新增 Live JournalId 的装配策略，明确它是否跨进程重启稳定，并与策略、账户、交易所和环境关联。
+3. 接入 Live ledger：仅由交易所确认的 `userFills` 写入 `Fill`，并补充账户快照、资金费与清算事件。
+4. 新增运行级 CLI/API 入口，串联 journal 读取、绩效计算和 Markdown/JSON 输出。
+5. 增加 `ClosedTrade` 明细、按标的/方向/时间聚合，以及在明确重采样和年化规则后加入
+   Sharpe/Sortino。
 
-- fill 的价格、数量、方向、手续费、订单关联信息；
-- funding 的费率、结算价、实际现金流；
-- liquidation 的已实现损益与原因；
-- equity snapshot 的时间序列。
+## 验证与工作区
 
-不要把派生指标（胜率、最大回撤、Sharpe）写回 ledger。
-
-## PerformanceReport 口径
-
-报告必须跨模式通用，至少包含：
-
-```text
-initial_equity
-final_equity
-net_pnl
-total_return
-realized_pnl
-unrealized_pnl
-trading_fees
-funding_pnl
-closed_trade_count
-win_rate
-average_win
-average_loss
-profit_factor
-max_drawdown
-max_drawdown_duration
-sharpe_ratio
-sortino_ratio
-liquidation_count
-peak_margin_used
-```
-
-定义：
-
-- `net_pnl = final_equity - initial_equity`。
-- `total_return = final_equity / initial_equity - 1`；初始权益非正时需显式处理，不能除零。
-- `win_rate` 只统计完整关闭仓位的净损益；不能用信号方向正确率替代。
-- 单笔净损益必须包含对应开/平仓手续费和持仓期间 funding。
-- `profit_factor = gross_profit / abs(gross_loss)`；无亏损需定义为 `None` 或明确的约定值，
-  不要返回无意义的无穷大 Decimal。
-- 最大回撤从 `EquitySnapshot` 的时间序列计算。
-- Sharpe/Sortino 需要先确定权益采样频率与无风险利率；不能从无时间序列的期末权益计算。
-- 实盘报告是“截至当前”，未平仓仓位计入 equity 与总收益，但不计入 closed-trade 胜率。
-
-## 回测 Broker 接入建议
-
-不要让 Broker 直接依赖 JSONL 或文件路径。推荐注入一个可选的、线程安全的 ledger
-recorder/sink；默认关闭，保持现有 `new()` API 可用。
-
-产生事件的时点：
-
-- `fill_market_order` 成功后：`Fill`；
-- 每次 `apply_funding`：`Funding`；
-- `liquidate_if_needed` 触发时：每个被平仓市场或一条明确的组合清算事件；
-- `set_mark_price`、成功成交、funding、清算后：`EquitySnapshot`。
-
-回测的 timestamp 目前大量使用 `Utc::now()`。为可复现报告，后续 replay 应提供事件时间，
-而不是依赖墙钟时间。可以先在 ledger API 中接受 timestamp，并在没有 replay 时回退至
-`Utc::now()`，但要将该限制写入文档或 TODO。
-
-## 实盘 Broker 接入建议
-
-- 仅在 exchange 已确认 fill 时记录 `Fill`，以 `userFills` 为优先数据源。
-- fee 应取交易所返回值；没有值时应显式标记缺失，不要伪造为零。
-- 账户 WS 快照或 reconciliation 后记录 `EquitySnapshot`。
-- funding 应来自交易所账单/用户资金费事件；当前客户端可能尚无该订阅或 REST 查询，需要
-  单独补齐。
-- 所有实盘事件都应带实际交易所时间和原始标识符，支持去重。
-
-## 测试与验收
-
-至少新增：
-
-1. fill、fee、funding、liquidation、equity snapshot 的 JSON 序列化/反序列化测试。
-2. Tracker 的增量结果与同一事件 JSONL 回放结果完全一致。
-3. 长仓与短仓 funding 的现金流方向测试。
-4. 一笔完整开平仓的净 PnL、胜率、盈亏比测试，含手续费与 funding。
-5. 未平仓仓位不进入 `closed_trade_count` 或 `win_rate` 的测试。
-6. 具有多个 equity snapshots 的最大回撤测试。
-7. 空事件、零初始资金、无亏损、无快照等边界行为测试。
-8. 现有回测 Broker 单测全绿；`cargo test -p qf` 全绿。
-
-## 注意事项
-
-- 这是跨 `audit`、`performance`、`storage`、`backtest`，后续还会涉及 `live` 的跨模块改动。
-- 保持最小可验证实现，不先做复杂图表、数据库或 CLI。
-- 不要修改或撤回当前工作区中其他人对 `live.rs` 的未提交变更。
-- 当前分支已有提交 `bb49fcd`，其中包含回测滑点、手续费、funding、简化清算实现。
-- 本会话后续又修改了 `backtest.rs`（funding/清算）；截至写此文件时未提交。提交前必须先
-  检查工作区，且只 stage 本次实际修改的文件。
+- 最近一次验证：`cargo fmt`、`cargo test -p qf`、`git diff --check`，共 58 个测试通过。
+- 已提交审计与存储基础设施：`0ce3e64 feat(audit): 增加可扩展审计账本存储`。
+- 当前仍有未提交的账本接入与术语调整，包含 `RunJournal` 强制注入与回测账本事件接入。

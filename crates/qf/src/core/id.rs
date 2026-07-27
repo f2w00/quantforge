@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Deserialize, Serialize)]
-pub struct RunId(pub String);
+pub struct JournalId(pub String);
 
-impl RunId {
+impl JournalId {
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
     }

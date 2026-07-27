@@ -143,34 +143,46 @@ impl LedgerSink for AsyncLedgerSink {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc::{Receiver, Sender, channel};
     use std::sync::{Arc, Mutex};
 
-    use crate::audit::{AuditAction, AuditEvent, LedgerEvent, LedgerEventKind};
-    use crate::core::{Decimal, RunId, RunMode, StrategyId};
+    use crate::audit::{AuditAction, AuditEvent, AuditRecord, LedgerEvent, LedgerEventKind};
+    use crate::core::{Decimal, JournalId, RunMode, StrategyId};
+    use crate::storage::{JsonlAuditSink, JsonlReader, JsonlWriter};
 
     use super::*;
 
+    static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
+
+    fn temporary_path() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "qf-async-jsonl-{}-{}-{}.jsonl",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap(),
+            NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed),
+        ))
+    }
+
     fn audit_event() -> AuditEvent {
         AuditEvent {
-            run_id: RunId::new("run-1"),
-            strategy_id: StrategyId::new("strategy-1"),
-            mode: RunMode::Backtest,
-            exchange: "hyperliquid".to_string(),
-            symbol: Some("BTC".to_string()),
-            action: AuditAction::PlaceOrder,
-            raw_request: serde_json::Value::Null,
-            risk_decision: None,
-            raw_response: None,
-            error: None,
-            timestamp: chrono::Utc::now(),
+            journal_id: JournalId::new("backtest-1"),
+            record_at: chrono::Utc::now(),
+            record: AuditRecord {
+                strategy_id: StrategyId::new("strategy-1"),
+                mode: RunMode::Backtest,
+                exchange: "hyperliquid".to_string(),
+                symbol: Some("BTC".to_string()),
+                action: AuditAction::PlaceOrder,
+                data: serde_json::Value::Null,
+            },
         }
     }
 
     fn ledger_event() -> LedgerEvent {
         LedgerEvent {
             event_id: "snapshot-1".to_string(),
-            run_id: RunId::new("run-1"),
             strategy_id: StrategyId::new("strategy-1"),
             mode: RunMode::Backtest,
             exchange: "hyperliquid".to_string(),
@@ -178,10 +190,10 @@ mod tests {
             event: LedgerEventKind::EquitySnapshot {
                 equity: Decimal::new(100, 0),
                 margin_used: Decimal::ZERO,
-                realized_pnl: Decimal::ZERO,
-                unrealized_pnl: Decimal::ZERO,
-                trading_fees: Decimal::ZERO,
-                funding_pnl: Decimal::ZERO,
+                realized_pnl: Some(Decimal::ZERO),
+                unrealized_pnl: Some(Decimal::ZERO),
+                trading_fees: Some(Decimal::ZERO),
+                funding_pnl: Some(Decimal::ZERO),
             },
         }
     }
@@ -221,6 +233,31 @@ mod tests {
         sink.shutdown().unwrap();
 
         assert_eq!(events.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn drains_audit_events_into_rotated_jsonl_segments() {
+        let path = temporary_path();
+        let writer = JsonlWriter::create(&path).unwrap();
+        let jsonl_sink = JsonlAuditSink::new(writer, 2).unwrap();
+        let mut sink = AsyncAuditSink::new(jsonl_sink, 8);
+
+        for _ in 0..3 {
+            sink.record(&audit_event()).unwrap();
+        }
+        sink.shutdown().unwrap();
+
+        let second_path = path.with_file_name(format!(
+            "{}-000001.{}",
+            path.file_stem().unwrap().to_string_lossy(),
+            path.extension().unwrap().to_string_lossy(),
+        ));
+        let first: Vec<AuditEvent> = JsonlReader::open(&path).unwrap().read_all().unwrap();
+        let second: Vec<AuditEvent> = JsonlReader::open(&second_path).unwrap().read_all().unwrap();
+
+        assert_eq!([first.len(), second.len()], [2, 1]);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(second_path).unwrap();
     }
 
     #[test]

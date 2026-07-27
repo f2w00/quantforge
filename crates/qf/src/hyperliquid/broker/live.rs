@@ -8,7 +8,8 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use tokio::sync::{mpsc, watch};
 
-use crate::core::{Decimal, StrategyId};
+use crate::audit::{AuditAction, AuditRecord, RunJournal};
+use crate::core::{Decimal, RunMode, StrategyId};
 use crate::hyperliquid::broker::HlBrokerError;
 use crate::hyperliquid::broker::risk_adapter::order_risk_input_at_price;
 use crate::hyperliquid::broker::state::HlBrokerState;
@@ -96,6 +97,7 @@ pub struct HlMarketConfig {
 
 pub struct HyperliquidLiveBroker {
     strategy_id: StrategyId,
+    journal: std::sync::Arc<RunJournal>,
     state: RwLock<HlBrokerState>,
     risk_guard: RiskGuard,
     client: HyperliquidRestClient,
@@ -180,6 +182,7 @@ impl HyperliquidLiveBroker {
         config: HlLiveBrokerConfig,
         signer: std::sync::Arc<HyperliquidSigner>,
         risk_guard: RiskGuard,
+        journal: std::sync::Arc<RunJournal>,
     ) -> Result<std::sync::Arc<Self>, HlBrokerError> {
         if config.default_market_slippage_bps >= 10_000
             || config.default_close_slippage_bps >= 10_000
@@ -215,6 +218,7 @@ impl HyperliquidLiveBroker {
             .map_err(transport_error)?;
         let broker = std::sync::Arc::new(Self::from_parts(
             config.strategy_id,
+            journal,
             HlBrokerState {
                 account,
                 open_orders,
@@ -265,6 +269,7 @@ impl HyperliquidLiveBroker {
     #[allow(clippy::too_many_arguments)]
     fn from_parts(
         strategy_id: StrategyId,
+        journal: std::sync::Arc<RunJournal>,
         state: HlBrokerState,
         risk_guard: RiskGuard,
         client: HyperliquidRestClient,
@@ -283,6 +288,7 @@ impl HyperliquidLiveBroker {
         let (ws_ready, _) = watch::channel(false);
         Self {
             strategy_id,
+            journal,
             state: RwLock::new(state),
             risk_guard,
             client,
@@ -416,6 +422,42 @@ impl HyperliquidLiveBroker {
             freshness.account = None;
             freshness.open_orders = None;
         });
+    }
+
+    fn record_audit(&self, action: AuditAction, symbol: Option<String>, data: serde_json::Value) {
+        self.journal.record_audit(AuditRecord {
+            strategy_id: self.strategy_id.clone(),
+            mode: RunMode::Live,
+            exchange: "hyperliquid".to_string(),
+            symbol,
+            action,
+            data,
+        });
+    }
+
+    fn audit_error(error: &HlBrokerError) -> serde_json::Value {
+        let outcome = match error {
+            HlBrokerError::RiskRejected { .. }
+            | HlBrokerError::InvalidRequest { .. }
+            | HlBrokerError::ExchangeRejected { .. } => "rejected",
+            HlBrokerError::OutcomeUnknown { .. } | HlBrokerError::CancelOutcomeUnknown { .. } => {
+                "outcome_unknown"
+            }
+            _ => "failed",
+        };
+        let mut value = serde_json::json!({
+            "outcome": outcome,
+            "error": error.to_string(),
+        });
+        if let HlBrokerError::ExchangeRejected { raw, .. } = error {
+            value["response"] = raw.clone();
+        }
+        if let HlBrokerError::RiskRejected { violations } = error {
+            value["risk_decision"] = serde_json::json!({
+                "Rejected": { "violations": violations },
+            });
+        }
+        value
     }
 
     fn confirm_ws_recovery(&self, message: &Value) {
@@ -626,6 +668,14 @@ impl HyperliquidLiveBroker {
                     }
                     Err(error) => {
                         eprintln!("Hyperliquid account reconciliation failed: {error}");
+                        self.record_audit(
+                            AuditAction::ReconcileState,
+                            None,
+                            serde_json::json!({
+                                "target": "account",
+                                "error": Self::audit_error(&transport_error(error)),
+                            }),
+                        );
                         let _ = self.mark_fresh(|freshness| freshness.account = None);
                     }
                 }
@@ -642,6 +692,14 @@ impl HyperliquidLiveBroker {
                     }
                     Err(error) => {
                         eprintln!("Hyperliquid open-order reconciliation failed: {error}");
+                        self.record_audit(
+                            AuditAction::ReconcileState,
+                            None,
+                            serde_json::json!({
+                                "target": "open_orders",
+                                "error": Self::audit_error(&transport_error(error)),
+                            }),
+                        );
                         let _ = self.mark_fresh(|freshness| freshness.open_orders = None);
                     }
                 }
@@ -713,6 +771,24 @@ impl HyperliquidLiveBroker {
     }
 
     pub async fn set_leverage(&self, market: &HlMarketConfig) -> Result<(), HlBrokerError> {
+        let result = self.set_leverage_inner(market).await;
+        let data = match &result {
+            Ok(()) => serde_json::json!({
+                "outcome": "accepted",
+                "leverage": market.leverage,
+                "is_cross": market.is_cross,
+            }),
+            Err(error) => serde_json::json!({
+                "leverage": market.leverage,
+                "is_cross": market.is_cross,
+                "error": Self::audit_error(error),
+            }),
+        };
+        self.record_audit(AuditAction::SetLeverage, Some(market.coin.0.clone()), data);
+        result
+    }
+
+    async fn set_leverage_inner(&self, market: &HlMarketConfig) -> Result<(), HlBrokerError> {
         if market.leverage == 0 {
             return Err(HlBrokerError::InvalidRequest {
                 message: "leverage must be positive".to_string(),
@@ -1128,23 +1204,8 @@ fn order_status_from_response(raw: &Value) -> Option<HlTrackedOrderState> {
     }
 }
 
-#[async_trait::async_trait]
-impl HyperliquidBroker for HyperliquidLiveBroker {
-    fn account_state(&self) -> Result<HlAccountState, HlBrokerError> {
-        self.state
-            .read()
-            .map(|state| state.account.clone())
-            .map_err(|_| HlBrokerError::StateUnavailable)
-    }
-
-    fn open_orders(&self) -> Vec<HlOpenOrder> {
-        self.state
-            .read()
-            .map(|state| state.open_orders.clone())
-            .unwrap_or_default()
-    }
-
-    async fn place_order(
+impl HyperliquidLiveBroker {
+    async fn place_order_inner(
         &self,
         mut request: HlOrderRequest,
     ) -> Result<HlOrderResult, HlBrokerError> {
@@ -1361,7 +1422,7 @@ impl HyperliquidBroker for HyperliquidLiveBroker {
         Ok(result)
     }
 
-    async fn cancel_order(
+    async fn cancel_order_inner(
         &self,
         request: HlCancelRequest,
     ) -> Result<HlCancelResponse, HlBrokerError> {
@@ -1447,7 +1508,7 @@ impl HyperliquidBroker for HyperliquidLiveBroker {
         result
     }
 
-    async fn close_position(
+    async fn close_position_inner(
         &self,
         request: HlCloseRequest,
     ) -> Result<HlOrderResult, HlBrokerError> {
@@ -1477,7 +1538,7 @@ impl HyperliquidBroker for HyperliquidLiveBroker {
             }
         };
 
-        self.place_order(HlOrderRequest {
+        self.place_order_inner(HlOrderRequest {
             coin: request.coin,
             side: if position.size.is_sign_positive() {
                 crate::core::Side::Sell
@@ -1495,6 +1556,88 @@ impl HyperliquidBroker for HyperliquidLiveBroker {
             expires_after: request.expires_after,
         })
         .await
+    }
+}
+
+#[async_trait::async_trait]
+impl HyperliquidBroker for HyperliquidLiveBroker {
+    fn account_state(&self) -> Result<HlAccountState, HlBrokerError> {
+        self.state
+            .read()
+            .map(|state| state.account.clone())
+            .map_err(|_| HlBrokerError::StateUnavailable)
+    }
+
+    fn open_orders(&self) -> Vec<HlOpenOrder> {
+        self.state
+            .read()
+            .map(|state| state.open_orders.clone())
+            .unwrap_or_default()
+    }
+
+    async fn place_order(&self, request: HlOrderRequest) -> Result<HlOrderResult, HlBrokerError> {
+        let request_data = serde_json::to_value(&request).unwrap_or(serde_json::Value::Null);
+        let symbol = Some(request.coin.0.clone());
+        let result = self.place_order_inner(request).await;
+        let data = match &result {
+            Ok(result) => serde_json::json!({
+                "request": request_data,
+                "outcome": "accepted",
+                "client_order_id": result.submitted.client_order_id.as_str(),
+                "response": result.raw,
+            }),
+            Err(error) => serde_json::json!({
+                "request": request_data,
+                "error": Self::audit_error(error),
+            }),
+        };
+        self.record_audit(AuditAction::PlaceOrder, symbol, data);
+        result
+    }
+
+    async fn cancel_order(
+        &self,
+        request: HlCancelRequest,
+    ) -> Result<HlCancelResponse, HlBrokerError> {
+        let request_data = serde_json::to_value(&request).unwrap_or(serde_json::Value::Null);
+        let symbol = Some(request.coin.0.clone());
+        let result = self.cancel_order_inner(request).await;
+        let data = match &result {
+            Ok(result) => serde_json::json!({
+                "request": request_data,
+                "outcome": "accepted",
+                "response": result.raw,
+            }),
+            Err(error) => serde_json::json!({
+                "request": request_data,
+                "error": Self::audit_error(error),
+            }),
+        };
+        self.record_audit(AuditAction::CancelOrder, symbol, data);
+        result
+    }
+
+    async fn close_position(
+        &self,
+        request: HlCloseRequest,
+    ) -> Result<HlOrderResult, HlBrokerError> {
+        let request_data = serde_json::to_value(&request).unwrap_or(serde_json::Value::Null);
+        let symbol = Some(request.coin.0.clone());
+        let result = self.close_position_inner(request).await;
+        let data = match &result {
+            Ok(result) => serde_json::json!({
+                "request": request_data,
+                "outcome": "accepted",
+                "client_order_id": result.submitted.client_order_id.as_str(),
+                "response": result.raw,
+            }),
+            Err(error) => serde_json::json!({
+                "request": request_data,
+                "error": Self::audit_error(error),
+            }),
+        };
+        self.record_audit(AuditAction::ClosePosition, symbol, data);
+        result
     }
 }
 

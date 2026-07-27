@@ -7,7 +7,7 @@ pub mod symbol;
 pub mod time;
 
 pub use error::{QfError, QfResult};
-pub use id::{RunId, StrategyId};
+pub use id::{JournalId, StrategyId};
 pub use mode::RunMode;
 pub use order::{OrderId, OrderType, TimeInForce};
 pub use side::Side;

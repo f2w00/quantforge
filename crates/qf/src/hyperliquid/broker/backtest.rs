@@ -1,9 +1,13 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::json;
 
-use crate::core::{Decimal, OrderId, Side, StrategyId};
+use std::sync::Arc;
+
+use crate::audit::{LedgerEvent, LedgerEventKind, RunJournal};
+use crate::core::{Decimal, OrderId, RunMode, Side, StrategyId, Timestamp};
 use crate::hyperliquid::broker::HlBrokerError;
 use crate::hyperliquid::broker::risk_adapter::order_risk_input_at_price;
 use crate::hyperliquid::broker::state::HlBrokerState;
@@ -18,7 +22,9 @@ use crate::risk::{RiskDecision, RiskGuard};
 pub struct HyperliquidBacktestBroker {
     strategy_id: StrategyId,
     risk_guard: RiskGuard,
+    journal: Arc<RunJournal>,
     inner: Mutex<HyperliquidBacktestInner>,
+    next_ledger_event_id: AtomicU64,
 }
 
 struct HyperliquidBacktestInner {
@@ -37,12 +43,40 @@ struct HyperliquidBacktestInner {
     next_order_id: u64,
 }
 
+struct BacktestLiquidation {
+    symbol: String,
+    size: Decimal,
+    price: Decimal,
+    realized_pnl: Decimal,
+}
+
+struct BacktestFill {
+    size: Decimal,
+    fee: Decimal,
+    liquidations: Vec<BacktestLiquidation>,
+}
+
 impl HyperliquidBacktestBroker {
-    pub fn new(strategy_id: StrategyId, state: HlBrokerState, risk_guard: RiskGuard) -> Self {
+    pub fn new(
+        strategy_id: StrategyId,
+        state: HlBrokerState,
+        risk_guard: RiskGuard,
+        journal: Arc<RunJournal>,
+    ) -> Self {
+        Self::from_parts(strategy_id, state, risk_guard, journal)
+    }
+
+    fn from_parts(
+        strategy_id: StrategyId,
+        state: HlBrokerState,
+        risk_guard: RiskGuard,
+        journal: Arc<RunJournal>,
+    ) -> Self {
         let initial_equity = state.account.equity;
         Self {
             strategy_id,
             risk_guard,
+            journal,
             inner: Mutex::new(HyperliquidBacktestInner {
                 state,
                 mark_prices: HashMap::new(),
@@ -58,6 +92,7 @@ impl HyperliquidBacktestBroker {
                 liquidation_count: 0,
                 next_order_id: 1,
             }),
+            next_ledger_event_id: AtomicU64::new(1),
         }
     }
 
@@ -71,7 +106,11 @@ impl HyperliquidBacktestBroker {
             .map_err(|_| HlBrokerError::StateUnavailable)?;
         inner.mark_prices.insert(coin, price);
         inner.revalue_account();
-        inner.liquidate_if_needed();
+        let liquidations = inner.liquidate_if_needed();
+        let snapshot = inner.equity_snapshot();
+        drop(inner);
+        self.record_liquidations(liquidations, snapshot.0);
+        self.record_snapshot(snapshot);
         Ok(())
     }
 
@@ -88,7 +127,11 @@ impl HyperliquidBacktestBroker {
             position.leverage = Decimal::from(leverage);
         }
         inner.revalue_account();
-        inner.liquidate_if_needed();
+        let liquidations = inner.liquidate_if_needed();
+        let snapshot = inner.equity_snapshot();
+        drop(inner);
+        self.record_liquidations(liquidations, snapshot.0);
+        self.record_snapshot(snapshot);
         Ok(())
     }
 
@@ -117,7 +160,11 @@ impl HyperliquidBacktestBroker {
             .lock()
             .map_err(|_| HlBrokerError::StateUnavailable)?;
         inner.maintenance_margin_bps = bps;
-        inner.liquidate_if_needed();
+        let liquidations = inner.liquidate_if_needed();
+        let snapshot = inner.equity_snapshot();
+        drop(inner);
+        self.record_liquidations(liquidations, snapshot.0);
+        self.record_snapshot(snapshot);
         Ok(())
     }
 
@@ -152,9 +199,22 @@ impl HyperliquidBacktestBroker {
             .map(|position| -position.size * settlement_price * funding_rate)
             .unwrap_or(Decimal::ZERO);
         inner.funding_pnl += funding_cashflow;
-        inner.last_funding_at.insert(coin, settled_at);
+        inner.last_funding_at.insert(coin.clone(), settled_at);
         inner.revalue_account();
-        inner.liquidate_if_needed();
+        let liquidations = inner.liquidate_if_needed();
+        let snapshot = inner.equity_snapshot();
+        drop(inner);
+        self.record_ledger_event(
+            settled_at,
+            LedgerEventKind::Funding {
+                symbol: coin.0.clone(),
+                funding_rate: Some(funding_rate),
+                settlement_price: Some(settlement_price),
+                cashflow: funding_cashflow,
+            },
+        );
+        self.record_liquidations(liquidations, snapshot.0);
+        self.record_snapshot(snapshot);
         Ok(funding_cashflow)
     }
 
@@ -191,6 +251,39 @@ impl HyperliquidBacktestBroker {
             .lock()
             .map(|inner| inner.liquidation_count)
             .unwrap_or(0)
+    }
+
+    fn record_liquidations(&self, liquidations: Vec<BacktestLiquidation>, timestamp: Timestamp) {
+        for liquidation in liquidations {
+            self.record_ledger_event(
+                timestamp,
+                LedgerEventKind::Liquidation {
+                    symbol: Some(liquidation.symbol),
+                    size: Some(liquidation.size),
+                    price: Some(liquidation.price),
+                    realized_pnl: Some(liquidation.realized_pnl),
+                    fee: None,
+                    reason: Some("maintenance_margin_breach".to_string()),
+                },
+            );
+        }
+    }
+
+    fn record_snapshot(&self, snapshot: (Timestamp, LedgerEventKind)) {
+        self.record_ledger_event(snapshot.0, snapshot.1);
+    }
+
+    fn record_ledger_event(&self, timestamp: Timestamp, event: LedgerEventKind) {
+        let event_id = self.next_ledger_event_id.fetch_add(1, Ordering::Relaxed);
+        let event = LedgerEvent {
+            event_id: format!("bt-{}-{event_id}", self.journal.journal_id().0),
+            strategy_id: self.strategy_id.clone(),
+            mode: RunMode::Backtest,
+            exchange: "hyperliquid".to_string(),
+            timestamp,
+            event,
+        };
+        self.journal.record_ledger(&event);
     }
 }
 
@@ -243,9 +336,23 @@ impl HyperliquidBacktestInner {
         self.state.account.updated_at = chrono::Utc::now();
     }
 
-    fn liquidate_if_needed(&mut self) {
+    fn equity_snapshot(&self) -> (Timestamp, LedgerEventKind) {
+        (
+            self.state.account.updated_at,
+            LedgerEventKind::EquitySnapshot {
+                equity: self.state.account.equity,
+                margin_used: self.state.account.margin_used,
+                realized_pnl: Some(self.realized_pnl),
+                unrealized_pnl: Some(self.unrealized_pnl()),
+                trading_fees: Some(self.trading_fees),
+                funding_pnl: Some(self.funding_pnl),
+            },
+        )
+    }
+
+    fn liquidate_if_needed(&mut self) -> Vec<BacktestLiquidation> {
         if self.maintenance_margin_bps == 0 || self.state.account.positions.is_empty() {
-            return;
+            return Vec::new();
         }
         let positions = self
             .state
@@ -258,32 +365,41 @@ impl HyperliquidBacktestInner {
             .iter()
             .any(|position| !self.mark_prices.contains_key(&position.coin))
         {
-            return;
+            return Vec::new();
         }
         let maintenance_margin: Decimal = positions
             .iter()
             .map(|position| position.notional * bps_to_rate(self.maintenance_margin_bps))
             .sum();
         if self.state.account.equity > maintenance_margin {
-            return;
+            return Vec::new();
         }
 
         // 简化的组合保证金模型：触发后按当前 mark 平掉全部已定价仓位。
+        let mut liquidations = Vec::with_capacity(positions.len());
         for position in positions {
             let mark_price = self.mark_prices[&position.coin];
             let entry_price = position.entry_price.unwrap_or(mark_price);
-            self.realized_pnl += (mark_price - entry_price) * position.size;
+            let realized_pnl = (mark_price - entry_price) * position.size;
+            self.realized_pnl += realized_pnl;
+            liquidations.push(BacktestLiquidation {
+                symbol: position.coin.0.clone(),
+                size: position.size.abs(),
+                price: mark_price,
+                realized_pnl,
+            });
         }
         self.state.account.positions.clear();
         self.liquidation_count += 1;
         self.revalue_account();
+        liquidations
     }
 
     fn fill_market_order(
         &mut self,
         request: &HlOrderRequest,
         fill_price: Decimal,
-    ) -> Result<Decimal, HlBrokerError> {
+    ) -> Result<BacktestFill, HlBrokerError> {
         let HlOrderSize::Exact(size) = request.size else {
             return Err(invalid_request("backtest order size must be resolved"));
         };
@@ -373,10 +489,15 @@ impl HyperliquidBacktestInner {
                 .insert(request.coin.clone(), position);
         }
 
-        self.trading_fees += fill_size.abs() * fill_price * bps_to_rate(self.taker_fee_bps);
+        let fee = fill_size.abs() * fill_price * bps_to_rate(self.taker_fee_bps);
+        self.trading_fees += fee;
         self.revalue_account();
-        self.liquidate_if_needed();
-        Ok(fill_size.abs())
+        let liquidations = self.liquidate_if_needed();
+        Ok(BacktestFill {
+            size: fill_size.abs(),
+            fee,
+            liquidations,
+        })
     }
 }
 
@@ -563,13 +684,30 @@ impl HyperliquidBroker for HyperliquidBacktestBroker {
             return Err(HlBrokerError::RiskRejected { violations });
         }
 
-        let filled_size = inner.fill_market_order(&request, fill_price)?;
+        let fill = inner.fill_market_order(&request, fill_price)?;
         let order_id = inner.next_order_id();
         let client_order_id = match request.client_order_id {
             Some(client_order_id) => client_order_id,
             None => HlClientOrderId::new(format!("0x{:032x}", inner.next_order_id - 1))
                 .map_err(invalid_request)?,
         };
+        let snapshot = inner.equity_snapshot();
+        drop(inner);
+        self.record_ledger_event(
+            snapshot.0,
+            LedgerEventKind::Fill {
+                order_id: Some(order_id.0.clone()),
+                client_order_id: Some(client_order_id.as_str().to_string()),
+                symbol: request.coin.0.clone(),
+                side: request.side,
+                size: fill.size,
+                price: fill_price,
+                fee: Some(fill.fee),
+                reduce_only: Some(request.reduce_only),
+            },
+        );
+        self.record_liquidations(fill.liquidations, snapshot.0);
+        self.record_snapshot(snapshot);
 
         Ok(HlOrderResult {
             submitted: HlSubmittedOrder {
@@ -582,14 +720,14 @@ impl HyperliquidBroker for HyperliquidBacktestBroker {
             },
             outcome: HlOrderOutcome::Filled {
                 order_id,
-                total_size: filled_size,
+                total_size: fill.size,
                 avg_price: fill_price,
             },
             raw: json!({
                 "mode": "backtest",
                 "status": "filled",
                 "price": fill_price.to_string(),
-                "size": filled_size.to_string(),
+                "size": fill.size.to_string(),
             }),
         })
     }
@@ -650,8 +788,11 @@ impl HyperliquidBroker for HyperliquidBacktestBroker {
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
+    use std::sync::{Arc, Mutex};
 
     use super::*;
+    use crate::audit::{LedgerEvent, LedgerEventKind, LedgerSink, RunJournal};
+    use crate::core::JournalId;
     use crate::risk::RiskLimits;
 
     fn decimal(value: &str) -> Decimal {
@@ -659,6 +800,7 @@ mod tests {
     }
 
     fn broker() -> HyperliquidBacktestBroker {
+        let events = Arc::new(Mutex::new(Vec::new()));
         HyperliquidBacktestBroker::new(
             StrategyId::new("test"),
             HlBrokerState {
@@ -671,6 +813,39 @@ mod tests {
                 open_orders: Vec::new(),
             },
             RiskGuard::new(RiskLimits::default()),
+            Arc::new(RunJournal::new(
+                JournalId::new("test-journal"),
+                MemoryLedgerSink(events),
+            )),
+        )
+    }
+
+    struct MemoryLedgerSink(Arc<Mutex<Vec<LedgerEvent>>>);
+
+    impl LedgerSink for MemoryLedgerSink {
+        fn record(&mut self, event: &LedgerEvent) -> anyhow::Result<()> {
+            self.0.lock().unwrap().push(event.clone());
+            Ok(())
+        }
+    }
+
+    fn broker_with_ledger(events: Arc<Mutex<Vec<LedgerEvent>>>) -> HyperliquidBacktestBroker {
+        HyperliquidBacktestBroker::new(
+            StrategyId::new("test"),
+            HlBrokerState {
+                account: HlAccountState {
+                    equity: decimal("1000"),
+                    margin_used: Decimal::ZERO,
+                    positions: HashMap::new(),
+                    updated_at: chrono::Utc::now(),
+                },
+                open_orders: Vec::new(),
+            },
+            RiskGuard::new(RiskLimits::default()),
+            Arc::new(RunJournal::new(
+                JournalId::new("backtest-1"),
+                MemoryLedgerSink(events),
+            )),
         )
     }
 
@@ -950,6 +1125,87 @@ mod tests {
                 .to_string()
                 .contains("must be newer")
         );
+    }
+
+    #[tokio::test]
+    async fn records_fill_funding_and_equity_snapshots_to_ledger() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let coin = HlCoin::new("BTC");
+        let broker = broker_with_ledger(Arc::clone(&events));
+        broker.set_mark_price(coin.clone(), decimal("100")).unwrap();
+        broker
+            .place_order(market_order(&coin, Side::Buy, "2"))
+            .await
+            .unwrap();
+        broker
+            .apply_funding(coin, decimal("0.001"), decimal("100"), chrono::Utc::now())
+            .unwrap();
+
+        let events = events.lock().unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event.event,
+            LedgerEventKind::Fill {
+                ref symbol,
+                size,
+                price,
+                fee: Some(_),
+                ..
+            } if symbol == "BTC" && size == decimal("2") && price == decimal("100")
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event.event,
+            LedgerEventKind::Funding {
+                ref symbol,
+                cashflow,
+                ..
+            } if symbol == "BTC" && cashflow == decimal("-0.2")
+        )));
+        assert!(
+            events
+                .iter()
+                .filter(|event| matches!(event.event, LedgerEventKind::EquitySnapshot { .. }))
+                .count()
+                >= 3
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| event.event_id.starts_with("bt-backtest-1-"))
+        );
+    }
+
+    #[tokio::test]
+    async fn records_liquidation_and_equity_snapshot_to_ledger() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let coin = HlCoin::new("BTC");
+        let broker = broker_with_ledger(Arc::clone(&events));
+        broker.set_mark_price(coin.clone(), decimal("100")).unwrap();
+        broker.set_leverage(coin.clone(), 10).unwrap();
+        broker
+            .place_order(market_order(&coin, Side::Buy, "100"))
+            .await
+            .unwrap();
+        broker.set_mark_price(coin, decimal("10")).unwrap();
+
+        let events = events.lock().unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event.event,
+            LedgerEventKind::Liquidation {
+                symbol: Some(ref symbol),
+                size: Some(size),
+                price: Some(price),
+                realized_pnl,
+                ..
+            } if symbol == "BTC"
+                && size == decimal("100")
+                && price == decimal("10")
+                && realized_pnl == Some(decimal("-9000"))
+        )));
+        assert!(matches!(
+            events.last().map(|event| &event.event),
+            Some(LedgerEventKind::EquitySnapshot { margin_used, .. })
+                if *margin_used == Decimal::ZERO
+        ));
     }
 
     #[tokio::test]
