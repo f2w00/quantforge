@@ -27,6 +27,9 @@ struct HyperliquidBacktestInner {
     leverages: HashMap<HlCoin, u32>,
     initial_equity: Decimal,
     realized_pnl: Decimal,
+    trading_fees: Decimal,
+    market_slippage_bps: u32,
+    taker_fee_bps: u32,
     next_order_id: u64,
 }
 
@@ -42,6 +45,9 @@ impl HyperliquidBacktestBroker {
                 leverages: HashMap::new(),
                 initial_equity,
                 realized_pnl: Decimal::ZERO,
+                trading_fees: Decimal::ZERO,
+                market_slippage_bps: 0,
+                taker_fee_bps: 0,
                 next_order_id: 1,
             }),
         }
@@ -64,11 +70,33 @@ impl HyperliquidBacktestBroker {
         if leverage == 0 {
             return Err(invalid_request("leverage must be positive"));
         }
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| HlBrokerError::StateUnavailable)?;
+        inner.leverages.insert(coin.clone(), leverage);
+        if let Some(position) = inner.state.account.positions.get_mut(&coin) {
+            position.leverage = Decimal::from(leverage);
+        }
+        inner.revalue_account();
+        Ok(())
+    }
+
+    pub fn set_market_slippage_bps(&self, bps: u32) -> Result<(), HlBrokerError> {
+        validate_bps(bps, "market slippage")?;
         self.inner
             .lock()
             .map_err(|_| HlBrokerError::StateUnavailable)?
-            .leverages
-            .insert(coin, leverage);
+            .market_slippage_bps = bps;
+        Ok(())
+    }
+
+    pub fn set_taker_fee_bps(&self, bps: u32) -> Result<(), HlBrokerError> {
+        validate_bps(bps, "taker fee")?;
+        self.inner
+            .lock()
+            .map_err(|_| HlBrokerError::StateUnavailable)?
+            .taker_fee_bps = bps;
         Ok(())
     }
 
@@ -83,6 +111,13 @@ impl HyperliquidBacktestBroker {
         self.inner
             .lock()
             .map(|inner| inner.unrealized_pnl())
+            .unwrap_or(Decimal::ZERO)
+    }
+
+    pub fn trading_fees(&self) -> Decimal {
+        self.inner
+            .lock()
+            .map(|inner| inner.trading_fees)
             .unwrap_or(Decimal::ZERO)
     }
 }
@@ -111,10 +146,19 @@ impl HyperliquidBacktestInner {
         for position in self.state.account.positions.values_mut() {
             if let Some(mark_price) = self.mark_prices.get(&position.coin) {
                 position.notional = position.size.abs() * *mark_price;
+                let entry_price = position.entry_price.unwrap_or(*mark_price);
+                position.unrealized_pnl = (*mark_price - entry_price) * position.size;
+                let margin = position.notional / position.leverage;
+                position.return_on_equity = if margin > Decimal::ZERO {
+                    position.unrealized_pnl / margin
+                } else {
+                    Decimal::ZERO
+                };
             }
         }
 
-        self.state.account.equity = self.initial_equity + self.realized_pnl + self.unrealized_pnl();
+        self.state.account.equity =
+            self.initial_equity + self.realized_pnl + self.unrealized_pnl() - self.trading_fees;
         self.state.account.margin_used = self
             .state
             .account
@@ -123,12 +167,16 @@ impl HyperliquidBacktestInner {
             .filter(|position| position.leverage > Decimal::ZERO)
             .map(|position| position.notional / position.leverage)
             .sum();
+        self.state.account.updated_at = chrono::Utc::now();
+
+        // TODO: 回测 replay 应在每个 Hyperliquid funding 结算时刻调用显式结算方法，
+        // 使用历史 funding rate 与结算价格更新权益并记录可审计账本，避免从价格数据推导。
     }
 
     fn fill_market_order(
         &mut self,
         request: &HlOrderRequest,
-        mark_price: Decimal,
+        fill_price: Decimal,
     ) -> Result<Decimal, HlBrokerError> {
         let HlOrderSize::Exact(size) = request.size else {
             return Err(invalid_request("backtest order size must be resolved"));
@@ -167,7 +215,7 @@ impl HyperliquidBacktestInner {
 
         let current_entry_price = current_position
             .and_then(|position| position.entry_price)
-            .unwrap_or(mark_price);
+            .unwrap_or(fill_price);
         let new_size = current_size + fill_size;
 
         if current_size != Decimal::ZERO
@@ -180,7 +228,7 @@ impl HyperliquidBacktestInner {
                 -Decimal::ONE
             };
             self.realized_pnl +=
-                (mark_price - current_entry_price) * position_direction * closed_size;
+                (fill_price - current_entry_price) * position_direction * closed_size;
         }
 
         if new_size == Decimal::ZERO {
@@ -189,9 +237,9 @@ impl HyperliquidBacktestInner {
             let entry_price = if current_size == Decimal::ZERO
                 || current_size.is_sign_positive() != new_size.is_sign_positive()
             {
-                mark_price
+                fill_price
             } else if current_size.is_sign_positive() == fill_size.is_sign_positive() {
-                ((current_entry_price * current_size.abs()) + (mark_price * fill_size.abs()))
+                ((current_entry_price * current_size.abs()) + (fill_price * fill_size.abs()))
                     / new_size.abs()
             } else {
                 current_entry_price
@@ -201,13 +249,15 @@ impl HyperliquidBacktestInner {
                 coin: request.coin.clone(),
                 size: new_size,
                 entry_price: Some(entry_price),
-                notional: new_size.abs() * mark_price,
+                notional: new_size.abs() * fill_price,
                 unrealized_pnl: Decimal::ZERO,
                 return_on_equity: Decimal::ZERO,
                 leverage: current_position
                     .map(|position| position.leverage)
                     .filter(|leverage| *leverage > Decimal::ZERO)
-                    .unwrap_or(Decimal::ONE),
+                    .unwrap_or_else(|| {
+                        Decimal::from(*self.leverages.get(&request.coin).unwrap_or(&1))
+                    }),
                 liquidation_price: current_position.and_then(|position| position.liquidation_price),
             };
 
@@ -217,6 +267,7 @@ impl HyperliquidBacktestInner {
                 .insert(request.coin.clone(), position);
         }
 
+        self.trading_fees += fill_size.abs() * fill_price * bps_to_rate(self.taker_fee_bps);
         self.revalue_account();
         Ok(fill_size.abs())
     }
@@ -252,6 +303,82 @@ fn invalid_request(message: impl Into<String>) -> HlBrokerError {
     HlBrokerError::InvalidRequest {
         message: message.into(),
     }
+}
+
+fn validate_bps(bps: u32, field: &str) -> Result<(), HlBrokerError> {
+    if bps >= 10_000 {
+        return Err(invalid_request(format!(
+            "{field} must be less than 10000 bps"
+        )));
+    }
+    Ok(())
+}
+
+fn bps_to_rate(bps: u32) -> Decimal {
+    Decimal::from(bps) / Decimal::from(10_000)
+}
+
+fn market_fill_price(
+    mark_price: Decimal,
+    side: Side,
+    configured_slippage_bps: u32,
+    max_slippage_bps: Option<u32>,
+) -> Result<Decimal, HlBrokerError> {
+    if let Some(max_slippage_bps) = max_slippage_bps {
+        if configured_slippage_bps > max_slippage_bps {
+            return Err(invalid_request(
+                "configured market slippage exceeds order maximum slippage",
+            ));
+        }
+    }
+    let rate = bps_to_rate(configured_slippage_bps);
+    Ok(match side {
+        Side::Buy => mark_price * (Decimal::ONE + rate),
+        Side::Sell => mark_price * (Decimal::ONE - rate),
+    })
+}
+
+fn ensure_sufficient_margin(
+    inner: &HyperliquidBacktestInner,
+    request: &HlOrderRequest,
+    size: Decimal,
+    mark_price: Decimal,
+    fill_price: Decimal,
+) -> Result<(), HlBrokerError> {
+    if request.reduce_only {
+        return Ok(());
+    }
+    let signed_size = if request.side == Side::Buy {
+        size
+    } else {
+        -size
+    };
+    let current_position = inner.state.account.positions.get(&request.coin);
+    let current_size = current_position
+        .map(|position| position.size)
+        .unwrap_or(Decimal::ZERO);
+    let new_size = current_size + signed_size;
+    if new_size.abs() <= current_size.abs() {
+        return Ok(());
+    }
+    let leverage = current_position
+        .map(|position| position.leverage)
+        .filter(|leverage| *leverage > Decimal::ZERO)
+        .unwrap_or_else(|| Decimal::from(*inner.leverages.get(&request.coin).unwrap_or(&1)));
+    let current_margin = current_position
+        .map(|position| position.notional / position.leverage)
+        .unwrap_or(Decimal::ZERO);
+    let projected_margin =
+        inner.state.account.margin_used - current_margin + (new_size.abs() * mark_price / leverage);
+    let fee = size * fill_price * bps_to_rate(inner.taker_fee_bps);
+    let projected_equity =
+        inner.state.account.equity + (mark_price - fill_price) * signed_size - fee;
+    if projected_margin > projected_equity.max(Decimal::ZERO) {
+        return Err(invalid_request(
+            "insufficient equity for projected initial margin",
+        ));
+    }
+    Ok(())
 }
 
 #[async_trait::async_trait]
@@ -304,12 +431,23 @@ impl HyperliquidBroker for HyperliquidBacktestBroker {
         };
         let mut request = request;
         request.size = HlOrderSize::Exact(size);
+        let max_slippage_bps = match request.order_type {
+            HlOrderType::Market { max_slippage_bps } => max_slippage_bps,
+            _ => unreachable!("market order checked above"),
+        };
+        let fill_price = market_fill_price(
+            mark_price,
+            request.side,
+            inner.market_slippage_bps,
+            max_slippage_bps,
+        )?;
+        ensure_sufficient_margin(&inner, &request, size, mark_price, fill_price)?;
         let input = order_risk_input_at_price(
             self.strategy_id.clone(),
             &inner.state.account,
             &request,
             size,
-            mark_price,
+            fill_price,
             &inner.state.open_orders,
             Decimal::ZERO,
         );
@@ -318,7 +456,7 @@ impl HyperliquidBroker for HyperliquidBacktestBroker {
             return Err(HlBrokerError::RiskRejected { violations });
         }
 
-        let filled_size = inner.fill_market_order(&request, mark_price)?;
+        let filled_size = inner.fill_market_order(&request, fill_price)?;
         let order_id = inner.next_order_id();
         let client_order_id = match request.client_order_id {
             Some(client_order_id) => client_order_id,
@@ -331,19 +469,19 @@ impl HyperliquidBroker for HyperliquidBacktestBroker {
                 coin: request.coin,
                 side: request.side,
                 size,
-                limit_price: mark_price,
+                limit_price: fill_price,
                 reduce_only: request.reduce_only,
                 client_order_id,
             },
             outcome: HlOrderOutcome::Filled {
                 order_id,
                 total_size: filled_size,
-                avg_price: mark_price,
+                avg_price: fill_price,
             },
             raw: json!({
                 "mode": "backtest",
                 "status": "filled",
-                "price": mark_price.to_string(),
+                "price": fill_price.to_string(),
                 "size": filled_size.to_string(),
             }),
         })
@@ -604,6 +742,80 @@ mod tests {
 
         assert_eq!(result.submitted.size, decimal("20"));
         assert_eq!(broker.position(&coin).unwrap().size, decimal("20"));
+        assert_eq!(broker.position(&coin).unwrap().leverage, decimal("5"));
+        assert_eq!(broker.account_state().unwrap().margin_used, decimal("400"));
+    }
+
+    #[tokio::test]
+    async fn applies_deterministic_adverse_slippage_and_taker_fee() {
+        let coin = HlCoin::new("BTC");
+        let broker = broker();
+        broker.set_mark_price(coin.clone(), decimal("100")).unwrap();
+        broker.set_market_slippage_bps(100).unwrap();
+        broker.set_taker_fee_bps(20).unwrap();
+
+        let result = broker
+            .place_order(market_order(&coin, Side::Buy, "2"))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            result.outcome,
+            HlOrderOutcome::Filled { avg_price, .. } if avg_price == decimal("101")
+        ));
+        assert_eq!(
+            broker.position(&coin).unwrap().entry_price,
+            Some(decimal("101"))
+        );
+        assert_eq!(broker.trading_fees(), decimal("0.404"));
+        assert_eq!(broker.account_state().unwrap().equity, decimal("997.596"));
+    }
+
+    #[tokio::test]
+    async fn rejects_slippage_above_order_protection() {
+        let coin = HlCoin::new("BTC");
+        let broker = broker();
+        broker.set_mark_price(coin.clone(), decimal("100")).unwrap();
+        broker.set_market_slippage_bps(101).unwrap();
+
+        let error = broker
+            .place_order(market_order(&coin, Side::Buy, "1"))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("exceeds order maximum"));
+        assert!(broker.position(&coin).is_none());
+    }
+
+    #[tokio::test]
+    async fn updates_existing_position_margin_when_leverage_changes() {
+        let coin = HlCoin::new("BTC");
+        let broker = broker();
+        broker.set_mark_price(coin.clone(), decimal("100")).unwrap();
+        broker
+            .place_order(market_order(&coin, Side::Buy, "2"))
+            .await
+            .unwrap();
+
+        broker.set_leverage(coin.clone(), 4).unwrap();
+
+        assert_eq!(broker.position(&coin).unwrap().leverage, decimal("4"));
+        assert_eq!(broker.account_state().unwrap().margin_used, decimal("50"));
+    }
+
+    #[tokio::test]
+    async fn rejects_order_when_projected_initial_margin_exceeds_equity() {
+        let coin = HlCoin::new("BTC");
+        let broker = broker();
+        broker.set_mark_price(coin.clone(), decimal("100")).unwrap();
+
+        let error = broker
+            .place_order(market_order(&coin, Side::Buy, "11"))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("insufficient equity"));
+        assert!(broker.position(&coin).is_none());
     }
 
     #[tokio::test]
