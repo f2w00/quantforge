@@ -744,10 +744,17 @@ impl HyperliquidBroker for HyperliquidLiveBroker {
             .unwrap_or_default()
     }
 
-    fn open_orders(&self) -> Vec<HlOpenOrder> {
+    fn open_orders(&self, coin: Option<&HlCoin>) -> Vec<HlOpenOrder> {
         self.state
             .read()
-            .map(|state| state.open_orders.clone())
+            .map(|state| {
+                state
+                    .open_orders
+                    .iter()
+                    .filter(|order| coin.is_none_or(|coin| order.coin == *coin))
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default()
     }
 

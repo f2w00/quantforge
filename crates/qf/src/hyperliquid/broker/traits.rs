@@ -14,8 +14,8 @@ pub trait HyperliquidBroker: Send + Sync {
     /// 返回 broker 当前维护的本地账户快照，不主动发起远端同步。
     fn account_state(&self) -> HlAccountState;
 
-    /// 返回账户级本地 open order 快照。
-    fn open_orders(&self) -> Vec<HlOpenOrder>;
+    /// 返回账户级本地 open order 快照；指定 coin 时仅返回该币种订单。
+    fn open_orders(&self, coin: Option<&HlCoin>) -> Vec<HlOpenOrder>;
 
     async fn place_order(&self, request: HlOrderRequest) -> Result<HlOrderResult, HlBrokerError>;
 
@@ -34,13 +34,5 @@ pub trait HyperliquidBroker: Send + Sync {
             .positions
             .into_iter()
             .find(|position| &position.coin == coin)
-    }
-
-    /// 返回指定 coin 的本地 open order 快照。
-    fn open_orders_for(&self, coin: &HlCoin) -> Vec<HlOpenOrder> {
-        self.open_orders()
-            .into_iter()
-            .filter(|order| &order.coin == coin)
-            .collect()
     }
 }
