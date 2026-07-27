@@ -289,6 +289,44 @@ pub struct HlCloseRequest {
 pub enum HlCloseSize {
     Full,
     Exact(Decimal),
+    Fraction(Decimal),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub enum HlSizingPrice {
+    Market,
+    Exact(Decimal),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct HlSizingRequest {
+    pub coin: HlCoin,
+    pub margin_fraction: Decimal,
+    pub reserve_fraction: Decimal,
+    pub leverage: u32,
+    pub price: HlSizingPrice,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct HlSizingResult {
+    pub size: Decimal,
+    pub margin: Decimal,
+    pub notional: Decimal,
+    pub available_margin: Decimal,
+    pub reference_price: Decimal,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct HlCloseSizingRequest {
+    pub coin: HlCoin,
+    pub fraction: Decimal,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct HlCloseSizingResult {
+    pub current_position_size: Decimal,
+    pub close_size: Decimal,
+    pub remaining_size: Decimal,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

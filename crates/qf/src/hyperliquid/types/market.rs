@@ -10,7 +10,7 @@ pub struct HlCoin(pub String);
 
 impl HlCoin {
     pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
+        Self(value.into().trim().to_ascii_uppercase())
     }
 }
 
@@ -155,5 +155,10 @@ mod tests {
 
         assert_eq!(snapshot.mids[&HlCoin::new("BTC")], "100.5".parse().unwrap());
         assert_eq!(snapshot.mids[&HlCoin::new("ETH")], "3.25".parse().unwrap());
+    }
+
+    #[test]
+    fn normalizes_coin_case_and_whitespace() {
+        assert_eq!(HlCoin::new(" btc "), HlCoin::new("BTC"));
     }
 }

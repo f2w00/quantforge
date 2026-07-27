@@ -370,14 +370,20 @@ Hyperliquid 的杠杆是按 perp asset 设置，而不是账户全局设置。Li
 `calculate_order_size()` 使用以下保守计算：
 
 ```text
+reserve_margin = equity * reserve_fraction
 available_margin = max(equity - margin_used - reserve_margin, 0)
 margin = available_margin * margin_fraction
 notional = margin * leverage
 size = floor(notional / reference_price, size_decimals)
 ```
 
-该 helper 只产生建议数量。下单时 Broker 仍会把现有仓位、非 reduce-only 挂单和
-并发中的 pending order notional 纳入 post-trade 风控。
+其中 `margin_fraction=0.5` 代表可用保证金的 50%，`reserve_fraction=0.2` 代表
+账户 equity 的 20% 预留。该 helper 只产生建议数量；下单时 Broker 仍会把现有仓位、
+非 reduce-only 挂单和并发中的 pending order notional 纳入 post-trade 风控。
+
+策略可通过统一 `HyperliquidBroker` trait 调用开仓和平仓 sizing。`HlCloseSize` 支持
+`Full`、`Exact` 和 `Fraction`；`Fraction(0.5)` 由 Broker 根据最新本地仓位向下量化为
+实际 reduce-only 数量，避免策略读取仓位后再平仓的时间窗口。
 
 ## 初始化和状态同步
 

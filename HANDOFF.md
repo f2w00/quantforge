@@ -67,7 +67,11 @@ Objective
   - `orderUpdates` / `userFills` 的基础结构化内存投影，并保留 raw payload。
   - `HlMarketConfig` 目标市场配置，`connect()` 中仅对 Cross 市场设置并确认杠杆。
   - `updateLeverage` action 的 Alloy/rmp-serde 签名和 WS post。
-  - `calculate_order_size()`：按可用保证金比例、杠杆和价格计算向下量化的数量。
+  - trait 级 `calculate_order_size()`：`margin_fraction=0.5` 表示可用保证金的 50%，
+    `reserve_fraction=0.2` 表示账户 equity 的 20% 预留。
+  - trait 级 `calculate_close_size()` 和 `HlCloseSize::Fraction(0.5)`，按最新仓位
+    计算并向下量化 50% 的 reduce-only 平仓数量。
+  - `HlCoin::new()` 自动 trim 并规范化为 ASCII 大写。
   - 基于已有仓位、挂单和 pending 请求的 post-trade notional/leverage 风控。
 - 最近验证通过：
   ```text
