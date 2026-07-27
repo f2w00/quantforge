@@ -284,9 +284,11 @@ pub enum HlCancelTarget {
 pub struct HlOpenOrder {
     pub coin: HlCoin,
     pub order_id: OrderId,
+    pub client_order_id: Option<HlClientOrderId>,
     pub side: Side,
-    pub size: Decimal,
-    pub limit_price: Option<Decimal>,
+    /// 当前剩余未成交数量。
+    pub remaining_size: Decimal,
+    pub limit_price: Decimal,
     pub reduce_only: bool,
 }
 

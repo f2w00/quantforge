@@ -4,8 +4,8 @@ use serde::Deserialize;
 
 use crate::core::{Decimal, OrderId, Side};
 use crate::hyperliquid::types::{
-    HlAccountState, HlCoin, HlMetaResponse, HlMetadataSnapshot, HlMidSnapshot, HlOpenOrder,
-    HlPosition,
+    HlAccountState, HlClientOrderId, HlCoin, HlMetaResponse, HlMetadataSnapshot, HlMidSnapshot,
+    HlOpenOrder, HlPosition,
 };
 
 #[derive(Clone, Debug)]
@@ -183,6 +183,7 @@ impl TryFrom<ClearinghouseStateWire> for HlAccountState {
 pub(crate) struct OpenOrderWire {
     coin: String,
     oid: u64,
+    cloid: Option<String>,
     side: String,
     sz: String,
     limit_px: String,
@@ -202,9 +203,14 @@ impl TryFrom<OpenOrderWire> for HlOpenOrder {
         Ok(HlOpenOrder {
             coin: HlCoin::new(value.coin),
             order_id: OrderId::new(value.oid.to_string()),
+            client_order_id: value
+                .cloid
+                .map(HlClientOrderId::new)
+                .transpose()
+                .map_err(anyhow::Error::msg)?,
             side,
-            size: value.sz.parse()?,
-            limit_price: Some(value.limit_px.parse()?),
+            remaining_size: value.sz.parse()?,
+            limit_price: value.limit_px.parse()?,
             reduce_only: value.reduce_only,
         })
     }
@@ -282,6 +288,7 @@ mod tests {
                 "orders": [{
                     "coin": "ETH",
                     "oid": 42,
+                    "cloid": "0x00000000000000000000000000000001",
                     "side": "B",
                     "sz": "1.5",
                     "limitPx": "3000",
@@ -291,7 +298,12 @@ mod tests {
         });
         let orders = parse_ws_open_orders(&message).unwrap();
         assert_eq!(orders[0].order_id.0, "42");
+        assert_eq!(
+            orders[0].client_order_id.as_ref().unwrap().as_str(),
+            "0x00000000000000000000000000000001"
+        );
         assert_eq!(orders[0].side, Side::Buy);
-        assert_eq!(orders[0].size, "1.5".parse().unwrap());
+        assert_eq!(orders[0].remaining_size, "1.5".parse().unwrap());
+        assert_eq!(orders[0].limit_price, "3000".parse().unwrap());
     }
 }

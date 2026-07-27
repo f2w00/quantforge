@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use alloy::primitives::Address;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::core::{Decimal, StrategyId};
 use crate::hyperliquid::broker::HlBrokerError;
@@ -85,6 +85,8 @@ pub struct HyperliquidLiveBroker {
     freshness_max_age: std::time::Duration,
     freshness: RwLock<HlFreshness>,
     pending_notional: Mutex<HashMap<HlClientOrderId, Decimal>>,
+    orders: Mutex<HashMap<HlClientOrderId, HlTrackedOrder>>,
+    order_notifiers: Mutex<HashMap<HlClientOrderId, watch::Sender<HlTrackedOrder>>>,
     markets: HashMap<HlCoin, HlMarketConfig>,
     default_market_slippage_bps: u32,
     default_close_slippage_bps: u32,
@@ -107,6 +109,34 @@ pub struct HlUserFill {
     pub price: Option<crate::core::Decimal>,
     pub fee: Option<crate::core::Decimal>,
     pub raw: Value,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HlTrackedOrderState {
+    PendingSubmit,
+    Open,
+    Filled,
+    Canceled,
+    Rejected,
+    Expired,
+    OutcomeUnknown,
+}
+
+impl HlTrackedOrderState {
+    fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Filled | Self::Canceled | Self::Rejected | Self::Expired
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct HlTrackedOrder {
+    pub submitted: HlSubmittedOrder,
+    pub order_id: Option<String>,
+    pub filled_size: Decimal,
+    pub state: HlTrackedOrderState,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -232,6 +262,8 @@ impl HyperliquidLiveBroker {
                 open_orders: Some(Utc::now()),
             }),
             pending_notional: Mutex::new(HashMap::new()),
+            orders: Mutex::new(HashMap::new()),
+            order_notifiers: Mutex::new(HashMap::new()),
             markets,
             default_market_slippage_bps,
             default_close_slippage_bps,
@@ -300,9 +332,20 @@ impl HyperliquidLiveBroker {
         let broker = std::sync::Arc::clone(self);
         tokio::spawn(async move {
             while let Some(message) = events.recv().await {
-                let _ = broker.apply_ws_event(message);
+                if broker.apply_ws_event(message.clone()).is_err() {
+                    let _ = broker.invalidate_event_freshness(&message);
+                }
             }
         });
+    }
+
+    fn invalidate_event_freshness(&self, message: &Value) -> Result<(), HlBrokerError> {
+        match message.get("channel").and_then(Value::as_str) {
+            Some("clearinghouseState") => self.mark_fresh(|freshness| freshness.account = None),
+            Some("openOrders") => self.mark_fresh(|freshness| freshness.open_orders = None),
+            Some("allMids") => self.mark_fresh(|freshness| freshness.mids = None),
+            _ => Ok(()),
+        }
     }
 
     fn apply_ws_event(&self, message: Value) -> Result<(), HlBrokerError> {
@@ -323,12 +366,15 @@ impl HyperliquidLiveBroker {
                     .write()
                     .map_err(|_| HlBrokerError::StateUnavailable)?
                     .open_orders = open_orders;
+                self.confirm_pending_open_orders()?;
                 self.mark_fresh(|freshness| freshness.open_orders = Some(Utc::now()))?;
                 Ok(())
             }
             Some("orderUpdates") => {
                 for value in event_values(&message) {
-                    push_bounded(&self.order_updates, parse_order_update(&message, value))?;
+                    let update = parse_order_update(&message, value);
+                    self.apply_order_update(&update)?;
+                    push_bounded(&self.order_updates, update)?;
                 }
                 Ok(())
             }
@@ -467,6 +513,7 @@ impl HyperliquidLiveBroker {
                     if let Ok(mut state) = self.state.write() {
                         state.open_orders = open_orders;
                     }
+                    let _ = self.confirm_pending_open_orders();
                     let _ = self.mark_fresh(|freshness| freshness.open_orders = Some(Utc::now()));
                 } else {
                     let _ = self.mark_fresh(|freshness| freshness.open_orders = None);
@@ -499,8 +546,43 @@ impl HyperliquidLiveBroker {
         client_order_id: &HlClientOrderId,
     ) -> Result<Value, HlBrokerError> {
         let status = self.order_status(client_order_id.as_str()).await?;
-        self.release_pending_notional(client_order_id);
         Ok(status)
+    }
+
+    pub fn order(&self, client_order_id: &HlClientOrderId) -> Option<HlTrackedOrder> {
+        self.orders.lock().ok()?.get(client_order_id).cloned()
+    }
+
+    pub async fn wait_order_terminal(
+        &self,
+        client_order_id: &HlClientOrderId,
+        timeout: std::time::Duration,
+    ) -> Result<HlTrackedOrder, HlBrokerError> {
+        let mut receiver = self
+            .order_notifiers
+            .lock()
+            .map_err(|_| HlBrokerError::StateUnavailable)?
+            .get(client_order_id)
+            .map(watch::Sender::subscribe)
+            .ok_or_else(|| HlBrokerError::InvalidRequest {
+                message: format!("unknown client order id {}", client_order_id.as_str()),
+            })?;
+        tokio::time::timeout(timeout, async {
+            loop {
+                let order = receiver.borrow().clone();
+                if order.state.is_terminal() {
+                    return Ok(order);
+                }
+                receiver
+                    .changed()
+                    .await
+                    .map_err(|_| HlBrokerError::StateUnavailable)?;
+            }
+        })
+        .await
+        .map_err(|_| HlBrokerError::OrderWaitTimeout {
+            client_order_id: client_order_id.clone(),
+        })?
     }
 
     pub async fn set_leverage(&self, market: &HlMarketConfig) -> Result<(), HlBrokerError> {
@@ -563,6 +645,90 @@ impl HyperliquidLiveBroker {
         if let Ok(mut pending) = self.pending_notional.lock() {
             pending.remove(client_order_id);
         }
+    }
+
+    fn register_order(&self, submitted: HlSubmittedOrder) -> Result<(), HlBrokerError> {
+        let client_order_id = submitted.client_order_id.clone();
+        let order = HlTrackedOrder {
+            submitted,
+            order_id: None,
+            filled_size: Decimal::ZERO,
+            state: HlTrackedOrderState::PendingSubmit,
+        };
+        self.orders
+            .lock()
+            .map_err(|_| HlBrokerError::StateUnavailable)?
+            .insert(client_order_id.clone(), order.clone());
+        self.order_notifiers
+            .lock()
+            .map_err(|_| HlBrokerError::StateUnavailable)?
+            .insert(client_order_id, watch::channel(order).0);
+        Ok(())
+    }
+
+    fn update_order_state(
+        &self,
+        client_order_id: &HlClientOrderId,
+        state: HlTrackedOrderState,
+        order_id: Option<String>,
+        filled_size: Option<Decimal>,
+    ) {
+        let order = self.orders.lock().ok().and_then(|mut orders| {
+            let order = orders.get_mut(client_order_id)?;
+            order.state = state;
+            if order_id.is_some() {
+                order.order_id = order_id;
+            }
+            if let Some(filled_size) = filled_size {
+                order.filled_size = filled_size;
+            }
+            Some(order.clone())
+        });
+        if let Some(order) = order {
+            if order.state.is_terminal() {
+                self.release_pending_notional(client_order_id);
+            }
+            if let Some(sender) = self
+                .order_notifiers
+                .lock()
+                .ok()
+                .and_then(|notifiers| notifiers.get(client_order_id).cloned())
+            {
+                let _ = sender.send(order);
+            }
+        }
+    }
+
+    fn apply_order_update(&self, update: &HlOrderUpdate) -> Result<(), HlBrokerError> {
+        let Some(client_order_id) = update
+            .client_order_id
+            .as_deref()
+            .map(HlClientOrderId::new)
+            .transpose()
+            .map_err(|message| HlBrokerError::Transport { message })?
+        else {
+            return Ok(());
+        };
+        if let Some(state) = update.status.as_deref().and_then(order_update_state) {
+            self.update_order_state(&client_order_id, state, update.order_id.clone(), None);
+        }
+        Ok(())
+    }
+
+    fn confirm_pending_open_orders(&self) -> Result<(), HlBrokerError> {
+        let client_order_ids = self
+            .state
+            .read()
+            .map_err(|_| HlBrokerError::StateUnavailable)?
+            .open_orders
+            .iter()
+            .filter_map(|order| order.client_order_id.clone())
+            .collect::<Vec<_>>();
+        for client_order_id in client_order_ids {
+            self.release_pending_notional(&client_order_id);
+            self.update_order_state(&client_order_id, HlTrackedOrderState::Open, None, None);
+        }
+        Ok(())
     }
 }
 
@@ -735,6 +901,19 @@ fn parse_user_fill(message: &Value, value: &Value) -> HlUserFill {
     }
 }
 
+fn order_update_state(status: &str) -> Option<HlTrackedOrderState> {
+    match status.to_ascii_lowercase().as_str() {
+        "open" | "resting" => Some(HlTrackedOrderState::Open),
+        "filled" => Some(HlTrackedOrderState::Filled),
+        "canceled" | "margincanceled" | "selftradecanceled" | "delistedcanceled" => {
+            Some(HlTrackedOrderState::Canceled)
+        }
+        "rejected" => Some(HlTrackedOrderState::Rejected),
+        "expired" => Some(HlTrackedOrderState::Expired),
+        _ => None,
+    }
+}
+
 #[async_trait::async_trait]
 impl HyperliquidBroker for HyperliquidLiveBroker {
     fn account_state(&self) -> HlAccountState {
@@ -841,6 +1020,14 @@ impl HyperliquidBroker for HyperliquidLiveBroker {
             .client_order_id
             .clone()
             .expect("cloid generated above");
+        let submitted = HlSubmittedOrder {
+            coin: request.coin.clone(),
+            side: request.side,
+            size: normalized_size,
+            limit_price: price,
+            reduce_only: request.reduce_only,
+            client_order_id: client_order_id.clone(),
+        };
         if !request.reduce_only {
             let mut pending = self
                 .pending_notional
@@ -873,6 +1060,7 @@ impl HyperliquidBroker for HyperliquidLiveBroker {
                 return Err(HlBrokerError::RiskRejected { violations });
             }
         }
+        self.register_order(submitted.clone())?;
         let signer = &self.signer;
         let ws = &self.ws;
         let action = request.to_order_action(asset, price, normalized_size);
@@ -890,6 +1078,12 @@ impl HyperliquidBroker for HyperliquidLiveBroker {
             Ok(signed) => signed,
             Err(error) => {
                 self.release_pending_notional(&client_order_id);
+                self.update_order_state(
+                    &client_order_id,
+                    HlTrackedOrderState::Rejected,
+                    None,
+                    None,
+                );
                 return Err(HlBrokerError::Transport {
                     message: error.to_string(),
                 });
@@ -901,21 +1095,48 @@ impl HyperliquidBroker for HyperliquidLiveBroker {
                 "payload": signed.to_exchange_payload(),
             }))
             .await
-            .map_err(|_error| HlBrokerError::OutcomeUnknown {
-                client_order_id: client_order_id.clone(),
+            .map_err(|_error| {
+                self.update_order_state(
+                    &client_order_id,
+                    HlTrackedOrderState::OutcomeUnknown,
+                    None,
+                    None,
+                );
+                HlBrokerError::OutcomeUnknown {
+                    client_order_id: client_order_id.clone(),
+                }
             })?;
-        self.release_pending_notional(&client_order_id);
-        parse_order_result(
-            raw,
-            HlSubmittedOrder {
-                coin: request.coin,
-                side: request.side,
-                size: normalized_size,
-                limit_price: price,
-                reduce_only: request.reduce_only,
-                client_order_id,
-            },
-        )
+        let result = match parse_order_result(raw, submitted) {
+            Ok(result) => result,
+            Err(error) => {
+                self.update_order_state(
+                    &client_order_id,
+                    HlTrackedOrderState::Rejected,
+                    None,
+                    None,
+                );
+                return Err(error);
+            }
+        };
+        match &result.outcome {
+            HlOrderOutcome::Resting { order_id } => self.update_order_state(
+                &client_order_id,
+                HlTrackedOrderState::Open,
+                Some(order_id.0.clone()),
+                None,
+            ),
+            HlOrderOutcome::Filled {
+                order_id,
+                total_size,
+                ..
+            } => self.update_order_state(
+                &client_order_id,
+                HlTrackedOrderState::Filled,
+                Some(order_id.0.clone()),
+                Some(*total_size),
+            ),
+        }
+        Ok(result)
     }
 
     async fn cancel_order(

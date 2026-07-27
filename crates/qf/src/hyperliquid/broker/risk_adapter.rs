@@ -20,7 +20,7 @@ pub fn order_risk_input_at_price(
     let existing_open_order_notional: Decimal = open_orders
         .iter()
         .filter(|order| !order.reduce_only)
-        .filter_map(|order| order.limit_price.map(|price| price * order.size.abs()))
+        .map(|order| order.limit_price * order.remaining_size.abs())
         .sum();
     let projected_position_notional = projected_position_notional(account, request, order_notional);
     let post_trade_notional = existing_position_notional
