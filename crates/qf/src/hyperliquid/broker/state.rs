@@ -8,11 +8,7 @@ pub struct HlBrokerState {
 
 impl HlBrokerState {
     pub fn position(&self, coin: &HlCoin) -> Option<HlPosition> {
-        self.account
-            .positions
-            .iter()
-            .find(|position| &position.coin == coin)
-            .cloned()
+        self.account.positions.get(coin).cloned()
     }
 
     pub fn open_orders(&self, coin: &HlCoin) -> Vec<HlOpenOrder> {

@@ -9,6 +9,8 @@ pub struct HlPosition {
     pub size: Decimal,
     pub entry_price: Option<Decimal>,
     pub notional: Decimal,
+    pub unrealized_pnl: Decimal,
+    pub return_on_equity: Decimal,
     pub leverage: Decimal,
     pub liquidation_price: Option<Decimal>,
 }

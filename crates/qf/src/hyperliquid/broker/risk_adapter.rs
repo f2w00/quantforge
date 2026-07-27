@@ -14,7 +14,7 @@ pub fn order_risk_input_at_price(
     let order_notional = price * size.abs();
     let existing_position_notional: Decimal = account
         .positions
-        .iter()
+        .values()
         .map(|position| position.notional.abs())
         .sum();
     let existing_open_order_notional: Decimal = open_orders
@@ -26,8 +26,7 @@ pub fn order_risk_input_at_price(
     let post_trade_notional = existing_position_notional
         - account
             .positions
-            .iter()
-            .find(|position| position.coin == request.coin)
+            .get(&request.coin)
             .map(|position| position.notional.abs())
             .unwrap_or(Decimal::ZERO)
         + projected_position_notional
@@ -58,11 +57,7 @@ fn projected_position_notional(
     request: &HlOrderRequest,
     order_notional: Decimal,
 ) -> Decimal {
-    let Some(position) = account
-        .positions
-        .iter()
-        .find(|position| position.coin == request.coin)
-    else {
+    let Some(position) = account.positions.get(&request.coin) else {
         return if request.reduce_only {
             Decimal::ZERO
         } else {
@@ -81,6 +76,7 @@ fn projected_position_notional(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::str::FromStr;
 
     use super::*;
@@ -96,14 +92,20 @@ mod tests {
         let account = HlAccountState {
             equity: decimal("100"),
             margin_used: Decimal::ZERO,
-            positions: vec![HlPosition {
-                coin: HlCoin::new("BTC"),
-                size: decimal("1"),
-                entry_price: Some(decimal("100")),
-                notional: decimal("100"),
-                leverage: decimal("1"),
-                liquidation_price: None,
-            }],
+            positions: HashMap::from([(
+                HlCoin::new("BTC"),
+                HlPosition {
+                    coin: HlCoin::new("BTC"),
+                    size: decimal("1"),
+                    entry_price: Some(decimal("100")),
+                    notional: decimal("100"),
+                    unrealized_pnl: Decimal::ZERO,
+                    return_on_equity: Decimal::ZERO,
+                    leverage: decimal("1"),
+                    liquidation_price: None,
+                },
+            )]),
+            updated_at: None,
         };
         let request = HlOrderRequest {
             coin: HlCoin::new("BTC"),

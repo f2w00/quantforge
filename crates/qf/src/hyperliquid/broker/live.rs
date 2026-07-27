@@ -744,17 +744,10 @@ impl HyperliquidBroker for HyperliquidLiveBroker {
             .unwrap_or_default()
     }
 
-    fn open_orders(&self, coin: Option<&HlCoin>) -> Vec<HlOpenOrder> {
+    fn open_orders(&self) -> Vec<HlOpenOrder> {
         self.state
             .read()
-            .map(|state| {
-                state
-                    .open_orders
-                    .iter()
-                    .filter(|order| coin.is_none_or(|coin| order.coin == *coin))
-                    .cloned()
-                    .collect()
-            })
+            .map(|state| state.open_orders.clone())
             .unwrap_or_default()
     }
 
@@ -1308,7 +1301,8 @@ mod tests {
         let account = HlAccountState {
             equity: "1000".parse().unwrap(),
             margin_used: "100".parse().unwrap(),
-            positions: Vec::new(),
+            positions: HashMap::new(),
+            updated_at: None,
         };
         let size = resolve_margin_fraction_size(
             &account,

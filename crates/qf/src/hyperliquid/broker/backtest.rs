@@ -92,7 +92,7 @@ impl HyperliquidBacktestInner {
         self.state
             .account
             .positions
-            .iter()
+            .values()
             .filter_map(|position| {
                 let mark_price = self.mark_prices.get(&position.coin)?;
                 let entry_price = position.entry_price?;
@@ -108,7 +108,7 @@ impl HyperliquidBacktestInner {
     }
 
     fn revalue_account(&mut self) {
-        for position in &mut self.state.account.positions {
+        for position in self.state.account.positions.values_mut() {
             if let Some(mark_price) = self.mark_prices.get(&position.coin) {
                 position.notional = position.size.abs() * *mark_price;
             }
@@ -119,7 +119,7 @@ impl HyperliquidBacktestInner {
             .state
             .account
             .positions
-            .iter()
+            .values()
             .filter(|position| position.leverage > Decimal::ZERO)
             .map(|position| position.notional / position.leverage)
             .sum();
@@ -141,14 +141,9 @@ impl HyperliquidBacktestInner {
             Side::Buy => size,
             Side::Sell => -size,
         };
-        let position_index = self
-            .state
-            .account
-            .positions
-            .iter()
-            .position(|position| position.coin == request.coin);
-        let current_size = position_index
-            .map(|index| self.state.account.positions[index].size)
+        let current_position = self.state.account.positions.get(&request.coin);
+        let current_size = current_position
+            .map(|position| position.size)
             .unwrap_or(Decimal::ZERO);
 
         let fill_size = if request.reduce_only {
@@ -170,8 +165,8 @@ impl HyperliquidBacktestInner {
             requested_size
         };
 
-        let current_entry_price = position_index
-            .and_then(|index| self.state.account.positions[index].entry_price)
+        let current_entry_price = current_position
+            .and_then(|position| position.entry_price)
             .unwrap_or(mark_price);
         let new_size = current_size + fill_size;
 
@@ -189,9 +184,7 @@ impl HyperliquidBacktestInner {
         }
 
         if new_size == Decimal::ZERO {
-            if let Some(index) = position_index {
-                self.state.account.positions.remove(index);
-            }
+            self.state.account.positions.remove(&request.coin);
         } else {
             let entry_price = if current_size == Decimal::ZERO
                 || current_size.is_sign_positive() != new_size.is_sign_positive()
@@ -209,19 +202,19 @@ impl HyperliquidBacktestInner {
                 size: new_size,
                 entry_price: Some(entry_price),
                 notional: new_size.abs() * mark_price,
-                leverage: position_index
-                    .map(|index| self.state.account.positions[index].leverage)
+                unrealized_pnl: Decimal::ZERO,
+                return_on_equity: Decimal::ZERO,
+                leverage: current_position
+                    .map(|position| position.leverage)
                     .filter(|leverage| *leverage > Decimal::ZERO)
                     .unwrap_or(Decimal::ONE),
-                liquidation_price: position_index
-                    .and_then(|index| self.state.account.positions[index].liquidation_price),
+                liquidation_price: current_position.and_then(|position| position.liquidation_price),
             };
 
-            if let Some(index) = position_index {
-                self.state.account.positions[index] = position;
-            } else {
-                self.state.account.positions.push(position);
-            }
+            self.state
+                .account
+                .positions
+                .insert(request.coin.clone(), position);
         }
 
         self.revalue_account();
@@ -270,18 +263,10 @@ impl HyperliquidBroker for HyperliquidBacktestBroker {
             .unwrap_or_default()
     }
 
-    fn open_orders(&self, coin: Option<&HlCoin>) -> Vec<HlOpenOrder> {
+    fn open_orders(&self) -> Vec<HlOpenOrder> {
         self.inner
             .lock()
-            .map(|inner| {
-                inner
-                    .state
-                    .open_orders
-                    .iter()
-                    .filter(|order| coin.is_none_or(|coin| order.coin == *coin))
-                    .cloned()
-                    .collect()
-            })
+            .map(|inner| inner.state.open_orders.clone())
             .unwrap_or_default()
     }
 
@@ -435,7 +420,8 @@ mod tests {
                 account: HlAccountState {
                     equity: decimal("1000"),
                     margin_used: Decimal::ZERO,
-                    positions: Vec::new(),
+                    positions: HashMap::new(),
+                    updated_at: None,
                 },
                 open_orders: Vec::new(),
             },

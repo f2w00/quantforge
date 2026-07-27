@@ -1,4 +1,4 @@
-use chrono::Utc;
+use chrono::{TimeZone, Utc};
 use reqwest::Client;
 use serde::Deserialize;
 
@@ -104,6 +104,7 @@ impl HyperliquidRestClient {
 pub(crate) struct ClearinghouseStateWire {
     margin_summary: MarginSummaryWire,
     asset_positions: Vec<AssetPositionWire>,
+    time: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -125,6 +126,8 @@ struct PositionWire {
     szi: String,
     entry_px: Option<String>,
     position_value: String,
+    unrealized_pnl: String,
+    return_on_equity: String,
     leverage: LeverageWire,
     liquidation_px: Option<String>,
 }
@@ -143,23 +146,34 @@ impl TryFrom<ClearinghouseStateWire> for HlAccountState {
             .into_iter()
             .map(|asset| {
                 let position = asset.position;
-                Ok(HlPosition {
-                    coin: HlCoin::new(position.coin),
-                    size: position.szi.parse()?,
-                    entry_price: position.entry_px.map(|price| price.parse()).transpose()?,
-                    notional: position.position_value.parse::<Decimal>()?.abs(),
-                    leverage: Decimal::from(position.leverage.value),
-                    liquidation_price: position
-                        .liquidation_px
-                        .map(|price| price.parse())
-                        .transpose()?,
-                })
+                let coin = HlCoin::new(position.coin);
+                Ok((
+                    coin.clone(),
+                    HlPosition {
+                        coin,
+                        size: position.szi.parse()?,
+                        entry_price: position.entry_px.map(|price| price.parse()).transpose()?,
+                        notional: position.position_value.parse::<Decimal>()?.abs(),
+                        unrealized_pnl: position.unrealized_pnl.parse()?,
+                        return_on_equity: position.return_on_equity.parse()?,
+                        leverage: Decimal::from(position.leverage.value),
+                        liquidation_price: position
+                            .liquidation_px
+                            .map(|price| price.parse())
+                            .transpose()?,
+                    },
+                ))
             })
             .collect::<anyhow::Result<_>>()?;
         Ok(HlAccountState {
             equity: value.margin_summary.account_value.parse()?,
             margin_used: value.margin_summary.total_margin_used.parse()?,
             positions,
+            updated_at: Utc
+                .timestamp_millis_opt(value.time)
+                .single()
+                .ok_or_else(|| anyhow::anyhow!("invalid clearinghouseState timestamp"))
+                .map(Some)?,
         })
     }
 }
@@ -238,17 +252,27 @@ mod tests {
                             "szi": "0.1",
                             "entryPx": "100000",
                             "positionValue": "10000",
+                            "unrealizedPnl": "10",
+                            "returnOnEquity": "0.01",
                             "leverage": {"value": 10},
                             "liquidationPx": "90000"
                         }
-                    }]
+                    }],
+                    "time": 1_700_000_000_000_i64
                 }
             }
         });
         let account = parse_ws_clearinghouse_state(&message).unwrap();
         assert_eq!(account.equity, "1000".parse().unwrap());
-        assert_eq!(account.positions[0].coin, HlCoin::new("BTC"));
-        assert_eq!(account.positions[0].size, "0.1".parse().unwrap());
+        let position = account.positions.get(&HlCoin::new("BTC")).unwrap();
+        assert_eq!(position.coin, HlCoin::new("BTC"));
+        assert_eq!(position.size, "0.1".parse().unwrap());
+        assert_eq!(position.unrealized_pnl, "10".parse().unwrap());
+        assert_eq!(position.return_on_equity, "0.01".parse().unwrap());
+        assert_eq!(
+            account.updated_at.unwrap().timestamp_millis(),
+            1_700_000_000_000
+        );
     }
 
     #[test]
