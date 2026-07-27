@@ -1,7 +1,6 @@
 use crate::hyperliquid::types::{
-    HlAccountState, HlCancelRequest, HlCancelResponse, HlCloseRequest, HlCloseSizingRequest,
-    HlCloseSizingResult, HlCoin, HlOpenOrder, HlOrderRequest, HlOrderResult, HlPosition,
-    HlSizingRequest, HlSizingResult,
+    HlAccountState, HlCancelRequest, HlCancelResponse, HlCloseRequest, HlCoin, HlOpenOrder,
+    HlOrderRequest, HlOrderResult, HlPosition,
 };
 
 use super::HlBrokerError;
@@ -17,16 +16,6 @@ pub trait HyperliquidBroker: Send + Sync {
 
     /// 返回账户级本地 open order 快照。
     fn open_orders(&self) -> Vec<HlOpenOrder>;
-
-    async fn calculate_order_size(
-        &self,
-        request: HlSizingRequest,
-    ) -> Result<HlSizingResult, HlBrokerError>;
-
-    async fn calculate_close_size(
-        &self,
-        request: HlCloseSizingRequest,
-    ) -> Result<HlCloseSizingResult, HlBrokerError>;
 
     async fn place_order(&self, request: HlOrderRequest) -> Result<HlOrderResult, HlBrokerError>;
 

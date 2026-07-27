@@ -6,11 +6,12 @@ pub fn order_risk_input_at_price(
     strategy_id: StrategyId,
     account: &HlAccountState,
     request: &HlOrderRequest,
+    size: Decimal,
     price: Decimal,
     open_orders: &[HlOpenOrder],
     pending_notional: Decimal,
 ) -> RiskCheckInput {
-    let order_notional = price * request.size.abs();
+    let order_notional = price * size.abs();
     let existing_position_notional: Decimal = account
         .positions
         .iter()
@@ -107,10 +108,10 @@ mod tests {
         let request = HlOrderRequest {
             coin: HlCoin::new("BTC"),
             side: Side::Buy,
-            size: decimal("1"),
+            size: crate::hyperliquid::types::HlOrderSize::Exact(decimal("1")),
             reduce_only: false,
             order_type: HlOrderType::Market {
-                max_slippage_bps: 100,
+                max_slippage_bps: Some(100),
             },
             client_order_id: None,
             expires_after: None,
@@ -120,6 +121,7 @@ mod tests {
             StrategyId::new("test"),
             &account,
             &request,
+            decimal("1"),
             decimal("100"),
             &[],
             Decimal::ZERO,

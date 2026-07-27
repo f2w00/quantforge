@@ -10,9 +10,8 @@ use crate::hyperliquid::broker::state::HlBrokerState;
 use crate::hyperliquid::broker::traits::HyperliquidBroker;
 use crate::hyperliquid::types::{
     HlAccountState, HlCancelRequest, HlCancelResponse, HlCancelStatus, HlClientOrderId,
-    HlCloseRequest, HlCloseSize, HlCloseSizingRequest, HlCloseSizingResult, HlCoin, HlOpenOrder,
-    HlOrderOutcome, HlOrderRequest, HlOrderResult, HlOrderType, HlPosition, HlSizingPrice,
-    HlSizingRequest, HlSizingResult, HlSubmittedOrder,
+    HlCloseRequest, HlCloseSize, HlCoin, HlOpenOrder, HlOrderOutcome, HlOrderRequest,
+    HlOrderResult, HlOrderSize, HlOrderType, HlPosition, HlSubmittedOrder,
 };
 use crate::risk::{RiskDecision, RiskGuard};
 
@@ -25,6 +24,7 @@ pub struct HyperliquidBacktestBroker {
 struct HyperliquidBacktestInner {
     state: HlBrokerState,
     mark_prices: HashMap<HlCoin, Decimal>,
+    leverages: HashMap<HlCoin, u32>,
     initial_equity: Decimal,
     realized_pnl: Decimal,
     next_order_id: u64,
@@ -39,6 +39,7 @@ impl HyperliquidBacktestBroker {
             inner: Mutex::new(HyperliquidBacktestInner {
                 state,
                 mark_prices: HashMap::new(),
+                leverages: HashMap::new(),
                 initial_equity,
                 realized_pnl: Decimal::ZERO,
                 next_order_id: 1,
@@ -56,6 +57,18 @@ impl HyperliquidBacktestBroker {
             .map_err(|_| HlBrokerError::StateUnavailable)?;
         inner.mark_prices.insert(coin, price);
         inner.revalue_account();
+        Ok(())
+    }
+
+    pub fn set_leverage(&self, coin: HlCoin, leverage: u32) -> Result<(), HlBrokerError> {
+        if leverage == 0 {
+            return Err(invalid_request("leverage must be positive"));
+        }
+        self.inner
+            .lock()
+            .map_err(|_| HlBrokerError::StateUnavailable)?
+            .leverages
+            .insert(coin, leverage);
         Ok(())
     }
 
@@ -117,13 +130,16 @@ impl HyperliquidBacktestInner {
         request: &HlOrderRequest,
         mark_price: Decimal,
     ) -> Result<Decimal, HlBrokerError> {
-        if request.size <= Decimal::ZERO {
+        let HlOrderSize::Exact(size) = request.size else {
+            return Err(invalid_request("backtest order size must be resolved"));
+        };
+        if size <= Decimal::ZERO {
             return Err(invalid_request("order size must be positive"));
         }
 
         let requested_size = match request.side {
-            Side::Buy => request.size,
-            Side::Sell => -request.size,
+            Side::Buy => size,
+            Side::Sell => -size,
         };
         let position_index = self
             .state
@@ -149,7 +165,7 @@ impl HyperliquidBacktestInner {
             } else {
                 -Decimal::ONE
             };
-            direction * request.size.min(current_size.abs())
+            direction * size.min(current_size.abs())
         } else {
             requested_size
         };
@@ -213,6 +229,32 @@ impl HyperliquidBacktestInner {
     }
 }
 
+fn resolve_backtest_size(
+    account: &HlAccountState,
+    price: Decimal,
+    leverage: u32,
+    margin_fraction: Decimal,
+    reserve_fraction: Decimal,
+) -> Result<Decimal, HlBrokerError> {
+    if margin_fraction <= Decimal::ZERO || margin_fraction > Decimal::ONE {
+        return Err(invalid_request("margin fraction must be in (0, 1]"));
+    }
+    if reserve_fraction < Decimal::ZERO || reserve_fraction >= Decimal::ONE {
+        return Err(invalid_request("reserve fraction must be in [0, 1)"));
+    }
+    let available_margin =
+        (account.equity - account.margin_used - (account.equity * reserve_fraction))
+            .max(Decimal::ZERO);
+    let size = (available_margin * margin_fraction * Decimal::from(leverage) / price)
+        .round_dp_with_strategy(8, rust_decimal::RoundingStrategy::ToZero);
+    if size <= Decimal::ZERO {
+        return Err(invalid_request(
+            "sizing result is below the minimum quantity increment",
+        ));
+    }
+    Ok(size)
+}
+
 fn invalid_request(message: impl Into<String>) -> HlBrokerError {
     HlBrokerError::InvalidRequest {
         message: message.into(),
@@ -235,65 +277,6 @@ impl HyperliquidBroker for HyperliquidBacktestBroker {
             .unwrap_or_default()
     }
 
-    async fn calculate_order_size(
-        &self,
-        request: HlSizingRequest,
-    ) -> Result<HlSizingResult, HlBrokerError> {
-        if request.margin_fraction <= Decimal::ZERO || request.margin_fraction > Decimal::ONE {
-            return Err(invalid_request("margin fraction must be in (0, 1]"));
-        }
-        if request.reserve_fraction < Decimal::ZERO || request.reserve_fraction >= Decimal::ONE {
-            return Err(invalid_request("reserve fraction must be in [0, 1)"));
-        }
-        if request.leverage == 0 {
-            return Err(invalid_request("leverage must be positive"));
-        }
-        let inner = self
-            .inner
-            .lock()
-            .map_err(|_| HlBrokerError::StateUnavailable)?;
-        let reference_price = match request.price {
-            HlSizingPrice::Exact(price) if price > Decimal::ZERO => price,
-            HlSizingPrice::Exact(_) => {
-                return Err(invalid_request("reference price must be positive"));
-            }
-            HlSizingPrice::Market => *inner
-                .mark_prices
-                .get(&request.coin)
-                .ok_or(HlBrokerError::StateUnavailable)?,
-        };
-        let available_margin = (inner.state.account.equity
-            - inner.state.account.margin_used
-            - (inner.state.account.equity * request.reserve_fraction))
-            .max(Decimal::ZERO);
-        let margin = available_margin * request.margin_fraction;
-        let size = (margin * Decimal::from(request.leverage) / reference_price)
-            .round_dp_with_strategy(8, rust_decimal::RoundingStrategy::ToZero);
-        if size <= Decimal::ZERO {
-            return Err(invalid_request(
-                "sizing result is below the minimum quantity increment",
-            ));
-        }
-        Ok(HlSizingResult {
-            size,
-            margin,
-            notional: size * reference_price,
-            available_margin,
-            reference_price,
-        })
-    }
-
-    async fn calculate_close_size(
-        &self,
-        request: HlCloseSizingRequest,
-    ) -> Result<HlCloseSizingResult, HlBrokerError> {
-        let position = self
-            .position(&request.coin)
-            .filter(|position| position.size != Decimal::ZERO)
-            .ok_or_else(|| HlBrokerError::PositionUnavailable { coin: request.coin })?;
-        super::live::calculate_close_size(position.size, request.fraction, 8)
-    }
-
     async fn place_order(&self, request: HlOrderRequest) -> Result<HlOrderResult, HlBrokerError> {
         request.validate().map_err(invalid_request)?;
         if !matches!(request.order_type, HlOrderType::Market { .. }) {
@@ -310,10 +293,29 @@ impl HyperliquidBroker for HyperliquidBacktestBroker {
             .get(&request.coin)
             .copied()
             .ok_or(HlBrokerError::StateUnavailable)?;
+        let size = match request.size {
+            HlOrderSize::Exact(size) if size > Decimal::ZERO => size,
+            HlOrderSize::Exact(_) => return Err(invalid_request("order size must be positive")),
+            HlOrderSize::MarginFraction {
+                margin_fraction,
+                reserve_fraction,
+            } => resolve_backtest_size(
+                &inner.state.account,
+                mark_price,
+                *inner.leverages.get(&request.coin).ok_or_else(|| {
+                    invalid_request("margin-fraction sizing requires configured leverage")
+                })?,
+                margin_fraction,
+                reserve_fraction,
+            )?,
+        };
+        let mut request = request;
+        request.size = HlOrderSize::Exact(size);
         let input = order_risk_input_at_price(
             self.strategy_id.clone(),
             &inner.state.account,
             &request,
+            size,
             mark_price,
             &inner.state.open_orders,
             Decimal::ZERO,
@@ -335,7 +337,7 @@ impl HyperliquidBroker for HyperliquidBacktestBroker {
             submitted: HlSubmittedOrder {
                 coin: request.coin,
                 side: request.side,
-                size: request.size,
+                size,
                 limit_price: mark_price,
                 reduce_only: request.reduce_only,
                 client_order_id,
@@ -384,12 +386,7 @@ impl HyperliquidBroker for HyperliquidBacktestBroker {
                 return Err(invalid_request("close size must be positive"));
             }
             HlCloseSize::Fraction(fraction) => {
-                self.calculate_close_size(HlCloseSizingRequest {
-                    coin: request.coin.clone(),
-                    fraction,
-                })
-                .await?
-                .close_size
+                super::live::calculate_close_size(position.size, fraction, 8)?
             }
         };
 
@@ -400,7 +397,7 @@ impl HyperliquidBroker for HyperliquidBacktestBroker {
             } else {
                 Side::Buy
             },
-            size,
+            size: HlOrderSize::Exact(size),
             reduce_only: true,
             order_type: HlOrderType::Market {
                 max_slippage_bps: request.max_slippage_bps,
@@ -442,10 +439,10 @@ mod tests {
         HlOrderRequest {
             coin: coin.clone(),
             side,
-            size: decimal(size),
+            size: HlOrderSize::Exact(decimal(size)),
             reduce_only: false,
             order_type: HlOrderType::Market {
-                max_slippage_bps: 100,
+                max_slippage_bps: Some(100),
             },
             client_order_id: None,
             expires_after: None,
@@ -523,7 +520,7 @@ mod tests {
             .close_position(HlCloseRequest {
                 coin: coin.clone(),
                 size: HlCloseSize::Full,
-                max_slippage_bps: 100,
+                max_slippage_bps: Some(100),
                 client_order_id: None,
                 expires_after: None,
             })
@@ -549,7 +546,7 @@ mod tests {
             .close_position(HlCloseRequest {
                 coin: coin.clone(),
                 size: HlCloseSize::Exact(decimal("0.5")),
-                max_slippage_bps: 100,
+                max_slippage_bps: Some(100),
                 client_order_id: None,
                 expires_after: None,
             })
@@ -575,7 +572,7 @@ mod tests {
             .close_position(HlCloseRequest {
                 coin: coin.clone(),
                 size: HlCloseSize::Fraction(decimal("0.25")),
-                max_slippage_bps: 100,
+                max_slippage_bps: Some(100),
                 client_order_id: None,
                 expires_after: None,
             })
@@ -584,6 +581,35 @@ mod tests {
 
         assert_eq!(result.submitted.size, decimal("0.5"));
         assert_eq!(broker.position(&coin).unwrap().size, decimal("1.5"));
+    }
+
+    #[tokio::test]
+    async fn resolves_margin_fraction_inside_place_order() {
+        let coin = HlCoin::new("BTC");
+        let broker = broker();
+        broker.set_mark_price(coin.clone(), decimal("100")).unwrap();
+        broker.set_leverage(coin.clone(), 5).unwrap();
+
+        let result = broker
+            .place_order(HlOrderRequest {
+                coin: coin.clone(),
+                side: Side::Buy,
+                size: HlOrderSize::MarginFraction {
+                    margin_fraction: decimal("0.5"),
+                    reserve_fraction: decimal("0.2"),
+                },
+                reduce_only: false,
+                order_type: HlOrderType::Market {
+                    max_slippage_bps: None,
+                },
+                client_order_id: None,
+                expires_after: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.submitted.size, decimal("20"));
+        assert_eq!(broker.position(&coin).unwrap().size, decimal("20"));
     }
 
     #[tokio::test]

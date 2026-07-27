@@ -52,7 +52,7 @@ impl HlTriggerKind {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum HlOrderType {
     Market {
-        max_slippage_bps: u32,
+        max_slippage_bps: Option<u32>,
     },
     Limit {
         limit_price: Decimal,
@@ -67,7 +67,7 @@ pub enum HlOrderType {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum HlTriggerExecution {
-    Market { max_slippage_bps: u32 },
+    Market { max_slippage_bps: Option<u32> },
     Limit { limit_price: Decimal },
 }
 
@@ -127,22 +127,29 @@ impl Default for HlOrderGrouping {
 pub struct HlOrderRequest {
     pub coin: HlCoin,
     pub side: Side,
-    pub size: Decimal,
+    pub size: HlOrderSize,
     pub reduce_only: bool,
     pub order_type: HlOrderType,
     pub client_order_id: Option<HlClientOrderId>,
     pub expires_after: Option<Timestamp>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub enum HlOrderSize {
+    Exact(Decimal),
+    MarginFraction {
+        margin_fraction: Decimal,
+        reserve_fraction: Decimal,
+    },
+}
+
 impl HlOrderRequest {
     pub fn validate(&self) -> Result<(), String> {
-        if self.size <= Decimal::ZERO {
-            return Err("order size must be positive".to_string());
-        }
-
         match &self.order_type {
             HlOrderType::Market { max_slippage_bps } => {
-                validate_slippage(*max_slippage_bps)?;
+                if let Some(max_slippage_bps) = max_slippage_bps {
+                    validate_slippage(*max_slippage_bps)?;
+                }
             }
             HlOrderType::Limit { limit_price, .. } => {
                 validate_price(*limit_price, "limit price")?;
@@ -158,7 +165,9 @@ impl HlOrderRequest {
                 validate_price(*trigger_price, "trigger price")?;
                 match execution {
                     HlTriggerExecution::Market { max_slippage_bps } => {
-                        validate_slippage(*max_slippage_bps)?;
+                        if let Some(max_slippage_bps) = max_slippage_bps {
+                            validate_slippage(*max_slippage_bps)?;
+                        }
                     }
                     HlTriggerExecution::Limit { limit_price } => {
                         validate_price(*limit_price, "trigger limit price")?;
@@ -170,9 +179,14 @@ impl HlOrderRequest {
         Ok(())
     }
 
-    pub fn to_order_action(&self, asset: HlAssetId, price: Decimal) -> HlExchangeAction {
+    pub fn to_order_action(
+        &self,
+        asset: HlAssetId,
+        price: Decimal,
+        size: Decimal,
+    ) -> HlExchangeAction {
         HlExchangeAction::Order(HlOrderAction {
-            orders: vec![HlWireOrder::from_request(self, asset, price)],
+            orders: vec![HlWireOrder::from_request(self, asset, price, size)],
             grouping: HlOrderGrouping::Na,
         })
     }
@@ -280,7 +294,7 @@ pub struct HlOpenOrder {
 pub struct HlCloseRequest {
     pub coin: HlCoin,
     pub size: HlCloseSize,
-    pub max_slippage_bps: u32,
+    pub max_slippage_bps: Option<u32>,
     pub client_order_id: Option<HlClientOrderId>,
     pub expires_after: Option<Timestamp>,
 }
@@ -290,43 +304,6 @@ pub enum HlCloseSize {
     Full,
     Exact(Decimal),
     Fraction(Decimal),
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub enum HlSizingPrice {
-    Market,
-    Exact(Decimal),
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct HlSizingRequest {
-    pub coin: HlCoin,
-    pub margin_fraction: Decimal,
-    pub reserve_fraction: Decimal,
-    pub leverage: u32,
-    pub price: HlSizingPrice,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct HlSizingResult {
-    pub size: Decimal,
-    pub margin: Decimal,
-    pub notional: Decimal,
-    pub available_margin: Decimal,
-    pub reference_price: Decimal,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct HlCloseSizingRequest {
-    pub coin: HlCoin,
-    pub fraction: Decimal,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct HlCloseSizingResult {
-    pub current_position_size: Decimal,
-    pub close_size: Decimal,
-    pub remaining_size: Decimal,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -341,12 +318,17 @@ pub struct HlWireOrder {
 }
 
 impl HlWireOrder {
-    pub fn from_request(request: &HlOrderRequest, asset: HlAssetId, price: Decimal) -> Self {
+    pub fn from_request(
+        request: &HlOrderRequest,
+        asset: HlAssetId,
+        price: Decimal,
+        size: Decimal,
+    ) -> Self {
         Self {
             asset,
             is_buy: request.side == Side::Buy,
             price,
-            size: request.size,
+            size,
             reduce_only: request.reduce_only,
             order_type: request.order_type.clone(),
             client_order_id: request.client_order_id.clone(),

@@ -367,7 +367,7 @@ Hyperliquid 的杠杆是按 perp asset 设置，而不是账户全局设置。Li
 配置在 `connect()` 阶段发送 `updateLeverage` 并等待明确成功；任一配置失败时 Broker
 不会进入 ready 状态。当前实现仅支持 Cross，isolated 因需要独立保证金管理而明确拒绝。
 
-`calculate_order_size()` 使用以下保守计算：
+`HlOrderSize::MarginFraction` 在 `place_order()` 内部使用以下保守计算：
 
 ```text
 reserve_margin = equity * reserve_fraction
@@ -378,12 +378,13 @@ size = floor(notional / reference_price, size_decimals)
 ```
 
 其中 `margin_fraction=0.5` 代表可用保证金的 50%，`reserve_fraction=0.2` 代表
-账户 equity 的 20% 预留。该 helper 只产生建议数量；下单时 Broker 仍会把现有仓位、
-非 reduce-only 挂单和并发中的 pending order notional 纳入 post-trade 风控。
+账户 equity 的 20% 预留。策略表达数量意图，Broker 在下单路径中计算实际数量、
+执行精度处理，并把现有仓位、非 reduce-only 挂单和并发中的 pending order notional
+纳入 post-trade 风控。
 
-策略可通过统一 `HyperliquidBroker` trait 调用开仓和平仓 sizing。`HlCloseSize` 支持
-`Full`、`Exact` 和 `Fraction`；`Fraction(0.5)` 由 Broker 根据最新本地仓位向下量化为
-实际 reduce-only 数量，避免策略读取仓位后再平仓的时间窗口。
+`HlCloseSize` 支持 `Full`、`Exact` 和 `Fraction`；`Fraction(0.5)` 由 Broker 根据最新
+本地仓位向下量化为实际 reduce-only 数量，避免策略读取仓位后再平仓的时间窗口。市价
+开仓和收仓的滑点字段为可选，未指定时分别采用 LiveBroker 的默认配置。
 
 ## 初始化和状态同步
 
@@ -414,7 +415,7 @@ LiveBroker 的连接初始化计划为：
 - 账户级 open orders getter；
 - 强类型订单请求；
 - Market 的滑点参数；
-- Full/Exact 平仓请求；
+- Full/Exact/Fraction 平仓请求；
 - 强类型 cloid 和自动生成 cloid；
 - 结构化订单结果和 Broker 错误；
 - BacktestBroker 的异步接口迁移和基础成交测试。
@@ -425,7 +426,7 @@ LiveBroker 的连接初始化计划为：
 - Alloy + `rmp-serde` 的 L1 action 签名基础设施；
 - 官方 Rust SDK limit order 签名兼容性测试。
 - `updateLeverage` action 的签名、WS post 与 Cross target-market 初始化配置。
-- 基于可用保证金比例、目标杠杆和价格的向下量化 size helper。
+- `MarginFraction` 订单意图在下单路径中的向下量化与目标杠杆解析。
 - 现有仓位、挂单与 pending order notional 的 post-trade 风控计算。
 - LiveBroker 主账户 `connect().await` 初始化；
 - `allMids`、`clearinghouseState`、`openOrders`、`orderUpdates` 和 `userFills` 订阅；

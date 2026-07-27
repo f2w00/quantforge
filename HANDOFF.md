@@ -67,10 +67,10 @@ Objective
   - `orderUpdates` / `userFills` 的基础结构化内存投影，并保留 raw payload。
   - `HlMarketConfig` 目标市场配置，`connect()` 中仅对 Cross 市场设置并确认杠杆。
   - `updateLeverage` action 的 Alloy/rmp-serde 签名和 WS post。
-  - trait 级 `calculate_order_size()`：`margin_fraction=0.5` 表示可用保证金的 50%，
-    `reserve_fraction=0.2` 表示账户 equity 的 20% 预留。
-  - trait 级 `calculate_close_size()` 和 `HlCloseSize::Fraction(0.5)`，按最新仓位
-    计算并向下量化 50% 的 reduce-only 平仓数量。
+  - `HlOrderSize::{Exact, MarginFraction}`：`margin_fraction=0.5` 表示可用保证金的 50%，
+    `reserve_fraction=0.2` 表示账户 equity 的 20% 预留；由 `place_order()` 内部计算。
+  - `HlCloseSize::Fraction(0.5)` 按最新仓位计算并向下量化 50% 的 reduce-only 平仓数量。
+  - 市价开仓与平仓滑点可设为 `None`，分别使用 LiveBroker 配置的默认滑点。
   - `HlCoin::new()` 自动 trim 并规范化为 ASCII 大写。
   - 基于已有仓位、挂单和 pending 请求的 post-trade notional/leverage 风控。
 - 最近验证通过：
@@ -81,10 +81,10 @@ Objective
   ```
   测试结果：
   ```text
-  21 passed
+  27 passed
   0 failed
   ```
-- 最近已提交 `77dda3f feat(hyperliquid): 收紧实盘状态与请求语义`；当前本轮修改尚未提交。
+- 最近已提交 `9ef4c8e feat(hyperliquid): 统一仓位 sizing 接口`；当前本轮修改尚未提交。
 
 ### Active
 - 继续完成用户要求的“都实现”，重点剩余：
