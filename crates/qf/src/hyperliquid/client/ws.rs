@@ -12,6 +12,13 @@ const POST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<anyhow::Result<Value>>>>>;
 
+#[derive(Clone, Debug)]
+pub enum HyperliquidWsEvent {
+    Connected,
+    Disconnected,
+    Message(Value),
+}
+
 #[derive(Clone)]
 pub struct HyperliquidWsClient {
     pub base_url: String,
@@ -23,7 +30,7 @@ pub struct HyperliquidWsClient {
 impl HyperliquidWsClient {
     pub async fn connect(
         base_url: impl Into<String>,
-    ) -> anyhow::Result<(Self, mpsc::Receiver<Value>)> {
+    ) -> anyhow::Result<(Self, mpsc::Receiver<HyperliquidWsEvent>)> {
         let base_url = base_url.into();
         let (writer, mut outbound) = mpsc::channel::<Message>(128);
         let (events, event_rx) = mpsc::channel(128);
@@ -41,6 +48,9 @@ impl HyperliquidWsClient {
                         continue;
                     }
                 };
+                if events.send(HyperliquidWsEvent::Connected).await.is_err() {
+                    return;
+                }
                 let (mut sink, mut source) = stream.split();
                 for subscription in &subscriptions {
                     let _ = sink.send(subscription.clone()).await;
@@ -49,14 +59,12 @@ impl HyperliquidWsClient {
                 loop {
                     tokio::select! {
                         Some(message) = outbound.recv() => {
-                            if let Message::Text(text) = &message {
-                                if let Ok(value) = serde_json::from_str::<Value>(text) {
-                                    if value.get("method").and_then(Value::as_str) == Some("subscribe")
-                                        && !subscriptions.iter().any(|item| item == &message)
-                                    {
-                                        subscriptions.push(message.clone());
-                                    }
-                                }
+                            if let Message::Text(text) = &message
+                                && let Ok(value) = serde_json::from_str::<Value>(text)
+                                && value.get("method").and_then(Value::as_str) == Some("subscribe")
+                                && !subscriptions.iter().any(|item| item == &message)
+                            {
+                                subscriptions.push(message.clone());
                             }
                             if sink.send(message).await.is_err() {
                                 break;
@@ -72,13 +80,15 @@ impl HyperliquidWsClient {
                                 _ => continue,
                             };
                             let Ok(value) = value else { continue };
-                            if let Some(id) = value.pointer("/data/id").and_then(Value::as_u64) {
-                                if let Some(sender) = pending_reader.lock().ok().and_then(|mut map| map.remove(&id)) {
-                                    let _ = sender.send(Ok(value));
-                                    continue;
-                                }
+                            if let Some(id) = value.pointer("/data/id").and_then(Value::as_u64)
+                                && let Some(sender) = pending_reader.lock().ok().and_then(|mut map| map.remove(&id))
+                            {
+                                let _ = sender.send(Ok(value));
+                                continue;
                             }
-                            let _ = events.send(value).await;
+                            if events.send(HyperliquidWsEvent::Message(value)).await.is_err() {
+                                return;
+                            }
                         }
                         else => break,
                     }
@@ -89,6 +99,9 @@ impl HyperliquidWsClient {
                             "websocket connection closed before response",
                         )));
                     }
+                }
+                if events.send(HyperliquidWsEvent::Disconnected).await.is_err() {
+                    return;
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }

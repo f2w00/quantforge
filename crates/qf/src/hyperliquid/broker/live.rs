@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -14,6 +14,7 @@ use crate::hyperliquid::broker::risk_adapter::order_risk_input_at_price;
 use crate::hyperliquid::broker::state::HlBrokerState;
 use crate::hyperliquid::broker::traits::HyperliquidBroker;
 use crate::hyperliquid::client::rest::{parse_ws_clearinghouse_state, parse_ws_open_orders};
+use crate::hyperliquid::client::ws::HyperliquidWsEvent;
 use crate::hyperliquid::client::{HyperliquidRestClient, HyperliquidSigner, HyperliquidWsClient};
 use crate::hyperliquid::types::{
     HlAccountState, HlCancelRequest, HlCancelResponse, HlCancelStatus, HlClientOrderId,
@@ -24,6 +25,14 @@ use crate::hyperliquid::types::{
 use crate::risk::{RiskDecision, RiskGuard};
 
 const ACCOUNT_EVENT_HISTORY_LIMIT: usize = 1_000;
+const RECOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+const REQUIRED_SUBSCRIPTIONS: [&str; 5] = [
+    "allMids",
+    "clearinghouseState",
+    "openOrders",
+    "orderUpdates",
+    "userFills",
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HlNetwork {
@@ -61,6 +70,23 @@ pub struct HlLiveBrokerConfig {
     pub default_close_slippage_bps: u32,
 }
 
+impl HlLiveBrokerConfig {
+    pub fn new(strategy_id: StrategyId, account_address: Address) -> Self {
+        Self {
+            strategy_id,
+            network: HlNetwork::Testnet,
+            account_address,
+            metadata_refresh_interval: std::time::Duration::from_secs(60 * 60),
+            connect_timeout: std::time::Duration::from_secs(10),
+            freshness_max_age: std::time::Duration::from_secs(30),
+            reconciliation_interval: std::time::Duration::from_secs(10),
+            markets: Vec::new(),
+            default_market_slippage_bps: 100,
+            default_close_slippage_bps: 100,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct HlMarketConfig {
     pub coin: HlCoin,
@@ -84,7 +110,10 @@ pub struct HyperliquidLiveBroker {
     account_address: String,
     freshness_max_age: std::time::Duration,
     freshness: RwLock<HlFreshness>,
+    ws_ready: watch::Sender<bool>,
+    subscriptions: Mutex<HashSet<String>>,
     pending_notional: Mutex<HashMap<HlClientOrderId, Decimal>>,
+    pending_cancels: Mutex<HashSet<String>>,
     orders: Mutex<HashMap<HlClientOrderId, HlTrackedOrder>>,
     order_notifiers: Mutex<HashMap<HlClientOrderId, watch::Sender<HlTrackedOrder>>>,
     markets: HashMap<HlCoin, HlMarketConfig>,
@@ -141,7 +170,6 @@ pub struct HlTrackedOrder {
 
 #[derive(Clone, Debug, Default)]
 struct HlFreshness {
-    metadata: Option<DateTime<Utc>>,
     mids: Option<DateTime<Utc>>,
     account: Option<DateTime<Utc>>,
     open_orders: Option<DateTime<Utc>>,
@@ -251,8 +279,8 @@ impl HyperliquidLiveBroker {
         default_market_slippage_bps: u32,
         default_close_slippage_bps: u32,
     ) -> Self {
-        let metadata_updated_at = metadata.updated_at;
         let mids_updated_at = mids.updated_at;
+        let (ws_ready, _) = watch::channel(false);
         Self {
             strategy_id,
             state: RwLock::new(state),
@@ -269,12 +297,14 @@ impl HyperliquidLiveBroker {
             account_address,
             freshness_max_age,
             freshness: RwLock::new(HlFreshness {
-                metadata: metadata_updated_at,
                 mids: mids_updated_at,
                 account: Some(Utc::now()),
                 open_orders: Some(Utc::now()),
             }),
+            ws_ready,
+            subscriptions: Mutex::new(HashSet::new()),
             pending_notional: Mutex::new(HashMap::new()),
+            pending_cancels: Mutex::new(HashSet::new()),
             orders: Mutex::new(HashMap::new()),
             order_notifiers: Mutex::new(HashMap::new()),
             markets,
@@ -285,28 +315,32 @@ impl HyperliquidLiveBroker {
 
     async fn wait_for_subscriptions(
         &self,
-        mut events: mpsc::Receiver<Value>,
+        mut events: mpsc::Receiver<HyperliquidWsEvent>,
         timeout: std::time::Duration,
-    ) -> Result<mpsc::Receiver<Value>, HlBrokerError> {
-        let expected = [
-            "allMids",
-            "clearinghouseState",
-            "openOrders",
-            "orderUpdates",
-            "userFills",
-        ]
-        .into_iter()
-        .map(str::to_string)
-        .collect::<std::collections::HashSet<_>>();
+    ) -> Result<mpsc::Receiver<HyperliquidWsEvent>, HlBrokerError> {
+        let expected = REQUIRED_SUBSCRIPTIONS
+            .into_iter()
+            .map(str::to_string)
+            .collect::<std::collections::HashSet<_>>();
         let mut acknowledged = std::collections::HashSet::new();
         tokio::time::timeout(timeout, async {
             while acknowledged != expected {
-                let message = events
+                let event = events
                     .recv()
                     .await
                     .ok_or_else(|| HlBrokerError::Transport {
                         message: "websocket closed before subscription confirmation".to_string(),
                     })?;
+                let message = match event {
+                    HyperliquidWsEvent::Connected => continue,
+                    HyperliquidWsEvent::Disconnected => {
+                        return Err(HlBrokerError::Transport {
+                            message: "websocket disconnected before subscription confirmation"
+                                .to_string(),
+                        });
+                    }
+                    HyperliquidWsEvent::Message(message) => message,
+                };
                 match message.get("channel").and_then(Value::as_str) {
                     Some("subscriptionResponse") => {
                         let subscription_type = message
@@ -338,18 +372,72 @@ impl HyperliquidLiveBroker {
         .map_err(|_| HlBrokerError::Transport {
             message: "timed out waiting for websocket subscriptions".to_string(),
         })??;
+        if let Ok(mut subscriptions) = self.subscriptions.lock() {
+            *subscriptions = expected;
+        }
+        let _ = self.ws_ready.send(true);
         Ok(events)
     }
 
-    fn spawn_event_consumer(self: &std::sync::Arc<Self>, mut events: mpsc::Receiver<Value>) {
+    fn spawn_event_consumer(
+        self: &std::sync::Arc<Self>,
+        mut events: mpsc::Receiver<HyperliquidWsEvent>,
+    ) {
         let broker = std::sync::Arc::clone(self);
         tokio::spawn(async move {
-            while let Some(message) = events.recv().await {
-                if broker.apply_ws_event(message.clone()).is_err() {
-                    let _ = broker.invalidate_event_freshness(&message);
+            while let Some(event) = events.recv().await {
+                match event {
+                    HyperliquidWsEvent::Connected => {
+                        let _ = broker.ws_ready.send(false);
+                        if let Ok(mut subscriptions) = broker.subscriptions.lock() {
+                            subscriptions.clear();
+                        }
+                    }
+                    HyperliquidWsEvent::Disconnected => broker.mark_ws_unavailable(),
+                    HyperliquidWsEvent::Message(message) => {
+                        if broker.apply_ws_event(message.clone()).is_err() {
+                            let _ = broker.invalidate_event_freshness(&message);
+                        }
+                        broker.confirm_ws_recovery(&message);
+                    }
                 }
             }
+            broker.mark_ws_unavailable();
         });
+    }
+
+    fn mark_ws_unavailable(&self) {
+        let _ = self.ws_ready.send(false);
+        if let Ok(mut subscriptions) = self.subscriptions.lock() {
+            subscriptions.clear();
+        }
+        let _ = self.mark_fresh(|freshness| {
+            freshness.mids = None;
+            freshness.account = None;
+            freshness.open_orders = None;
+        });
+    }
+
+    fn confirm_ws_recovery(&self, message: &Value) {
+        if message.get("channel").and_then(Value::as_str) != Some("subscriptionResponse") {
+            return;
+        }
+        let Some(subscription) = message
+            .pointer("/data/subscription/type")
+            .and_then(Value::as_str)
+        else {
+            return;
+        };
+        let Ok(mut subscriptions) = self.subscriptions.lock() else {
+            return;
+        };
+        subscriptions.insert(subscription.to_string());
+        if REQUIRED_SUBSCRIPTIONS
+            .iter()
+            .all(|required| subscriptions.contains(*required))
+        {
+            let _ = self.ws_ready.send(true);
+        }
     }
 
     fn invalidate_event_freshness(&self, message: &Value) -> Result<(), HlBrokerError> {
@@ -416,6 +504,7 @@ impl HyperliquidLiveBroker {
             .write()
             .map_err(|_| HlBrokerError::StateUnavailable)?;
         update(&mut freshness);
+        self.ws_ready.send_modify(|_| {});
         Ok(())
     }
 
@@ -431,20 +520,36 @@ impl HyperliquidLiveBroker {
             .unwrap_or(false)
     }
 
-    fn ensure_trading_state_fresh(&self) -> Result<(), HlBrokerError> {
+    fn trading_state_is_fresh(&self) -> Result<bool, HlBrokerError> {
         let freshness = self
             .freshness
             .read()
             .map_err(|_| HlBrokerError::StateUnavailable)?
             .clone();
-        if !self.is_fresh(freshness.metadata)
-            || !self.is_fresh(freshness.mids)
-            || !self.is_fresh(freshness.account)
-            || !self.is_fresh(freshness.open_orders)
-        {
-            return Err(HlBrokerError::StateUnavailable);
+        Ok(*self.ws_ready.borrow()
+            && self.is_fresh(freshness.mids)
+            && self.is_fresh(freshness.account)
+            && self.is_fresh(freshness.open_orders))
+    }
+
+    async fn ensure_trading_state_fresh(&self) -> Result<(), HlBrokerError> {
+        if self.trading_state_is_fresh()? {
+            return Ok(());
         }
-        Ok(())
+        let mut ws_ready = self.ws_ready.subscribe();
+        tokio::time::timeout(RECOVERY_TIMEOUT, async {
+            loop {
+                if self.trading_state_is_fresh()? {
+                    return Ok(());
+                }
+                ws_ready
+                    .changed()
+                    .await
+                    .map_err(|_| HlBrokerError::StateUnavailable)?;
+            }
+        })
+        .await
+        .map_err(|_| HlBrokerError::StateUnavailable)?
     }
 
     pub async fn refresh_metadata(&self) -> Result<(), HlBrokerError> {
@@ -459,10 +564,6 @@ impl HyperliquidLiveBroker {
             .metadata
             .write()
             .map_err(|_| HlBrokerError::StateUnavailable)? = snapshot;
-        self.freshness
-            .write()
-            .map_err(|_| HlBrokerError::StateUnavailable)?
-            .metadata = Some(Utc::now());
         Ok(())
     }
 
@@ -506,7 +607,9 @@ impl HyperliquidLiveBroker {
             let mut ticker = tokio::time::interval(metadata_interval);
             loop {
                 ticker.tick().await;
-                let _ = metadata_broker.refresh_metadata().await;
+                if let Err(error) = metadata_broker.refresh_metadata().await {
+                    eprintln!("Hyperliquid metadata refresh failed: {error}");
+                }
             }
         });
 
@@ -514,22 +617,33 @@ impl HyperliquidLiveBroker {
             let mut ticker = tokio::time::interval(reconciliation_interval);
             loop {
                 ticker.tick().await;
-                if let Ok(account) = self.client.clearinghouse_state(&self.account_address).await {
-                    if let Ok(mut state) = self.state.write() {
-                        state.account = account;
+                match self.client.clearinghouse_state(&self.account_address).await {
+                    Ok(account) => {
+                        if let Ok(mut state) = self.state.write() {
+                            state.account = account;
+                        }
+                        let _ = self.mark_fresh(|freshness| freshness.account = Some(Utc::now()));
                     }
-                    let _ = self.mark_fresh(|freshness| freshness.account = Some(Utc::now()));
-                } else {
-                    let _ = self.mark_fresh(|freshness| freshness.account = None);
+                    Err(error) => {
+                        eprintln!("Hyperliquid account reconciliation failed: {error}");
+                        let _ = self.mark_fresh(|freshness| freshness.account = None);
+                    }
                 }
-                if let Ok(open_orders) = self.client.open_orders(&self.account_address).await {
-                    if let Ok(mut state) = self.state.write() {
-                        state.open_orders = open_orders;
+                match self.client.open_orders(&self.account_address).await {
+                    Ok(open_orders) => {
+                        if let Ok(mut state) = self.state.write() {
+                            state.open_orders = open_orders;
+                        }
+                        let _ = self.confirm_pending_open_orders();
+                        let _ = self.reconcile_unknown_orders().await;
+                        let _ = self.reconcile_pending_cancels().await;
+                        let _ =
+                            self.mark_fresh(|freshness| freshness.open_orders = Some(Utc::now()));
                     }
-                    let _ = self.confirm_pending_open_orders();
-                    let _ = self.mark_fresh(|freshness| freshness.open_orders = Some(Utc::now()));
-                } else {
-                    let _ = self.mark_fresh(|freshness| freshness.open_orders = None);
+                    Err(error) => {
+                        eprintln!("Hyperliquid open-order reconciliation failed: {error}");
+                        let _ = self.mark_fresh(|freshness| freshness.open_orders = None);
+                    }
                 }
             }
         })
@@ -743,6 +857,80 @@ impl HyperliquidLiveBroker {
         }
         Ok(())
     }
+
+    async fn reconcile_unknown_orders(&self) -> Result<(), HlBrokerError> {
+        let open_orders = self
+            .state
+            .read()
+            .map_err(|_| HlBrokerError::StateUnavailable)?
+            .open_orders
+            .clone();
+        let unknown_orders = self
+            .orders
+            .lock()
+            .map_err(|_| HlBrokerError::StateUnavailable)?
+            .iter()
+            .filter(|(_, order)| order.state == HlTrackedOrderState::OutcomeUnknown)
+            .map(|(client_order_id, _)| client_order_id.clone())
+            .collect::<Vec<_>>();
+        for client_order_id in unknown_orders {
+            if let Some(order) = open_orders
+                .iter()
+                .find(|order| order.client_order_id.as_ref() == Some(&client_order_id))
+            {
+                self.update_order_state(
+                    &client_order_id,
+                    HlTrackedOrderState::Open,
+                    Some(order.order_id.0.clone()),
+                    None,
+                );
+                continue;
+            }
+            if let Ok(raw) = self.reconcile_order(&client_order_id).await
+                && let Some(status) = order_status_from_response(&raw)
+            {
+                self.update_order_state(&client_order_id, status, None, None);
+            }
+        }
+        Ok(())
+    }
+
+    async fn reconcile_pending_cancels(&self) -> Result<(), HlBrokerError> {
+        let pending_cancels = self
+            .pending_cancels
+            .lock()
+            .map_err(|_| HlBrokerError::StateUnavailable)?
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        for target in pending_cancels {
+            let Ok(raw) = self.order_status(&target).await else {
+                continue;
+            };
+            let Some(state) = order_status_from_response(&raw) else {
+                continue;
+            };
+            if let Some(client_order_id) = self.client_order_id_for_target(&target) {
+                self.update_order_state(&client_order_id, state.clone(), None, None);
+            }
+            if state.is_terminal()
+                && let Ok(mut pending_cancels) = self.pending_cancels.lock()
+            {
+                pending_cancels.remove(&target);
+            }
+        }
+        Ok(())
+    }
+
+    fn client_order_id_for_target(&self, target: &str) -> Option<HlClientOrderId> {
+        HlClientOrderId::new(target).ok().or_else(|| {
+            self.orders.lock().ok().and_then(|orders| {
+                orders.iter().find_map(|(client_order_id, order)| {
+                    (order.order_id.as_deref() == Some(target)).then(|| client_order_id.clone())
+                })
+            })
+        })
+    }
 }
 
 fn current_millis() -> u64 {
@@ -927,6 +1115,19 @@ fn order_update_state(status: &str) -> Option<HlTrackedOrderState> {
     }
 }
 
+fn order_status_from_response(raw: &Value) -> Option<HlTrackedOrderState> {
+    match raw {
+        Value::Object(values) => values.iter().find_map(|(key, value)| {
+            (key == "status" || key == "orderStatus")
+                .then(|| value.as_str().and_then(order_update_state))
+                .flatten()
+                .or_else(|| order_status_from_response(value))
+        }),
+        Value::Array(values) => values.iter().find_map(order_status_from_response),
+        _ => None,
+    }
+}
+
 #[async_trait::async_trait]
 impl HyperliquidBroker for HyperliquidLiveBroker {
     fn account_state(&self) -> Result<HlAccountState, HlBrokerError> {
@@ -950,7 +1151,15 @@ impl HyperliquidBroker for HyperliquidLiveBroker {
         request
             .validate()
             .map_err(|message| HlBrokerError::InvalidRequest { message })?;
-        self.ensure_trading_state_fresh()?;
+        self.ensure_trading_state_fresh().await?;
+        if request
+            .expires_after
+            .is_some_and(|expires_after| expires_after <= Utc::now())
+        {
+            return Err(HlBrokerError::InvalidRequest {
+                message: "order expiration must be in the future".to_string(),
+            });
+        }
         if request.client_order_id.is_none() {
             request.client_order_id = Some(self.next_client_order_id());
         }
@@ -1154,29 +1363,35 @@ impl HyperliquidBroker for HyperliquidLiveBroker {
 
     async fn cancel_order(
         &self,
-        _request: HlCancelRequest,
+        request: HlCancelRequest,
     ) -> Result<HlCancelResponse, HlBrokerError> {
         let signer = &self.signer;
         let ws = &self.ws;
+        let target = match &request.target {
+            Some(crate::hyperliquid::types::HlCancelTarget::ClientOrderId(client_order_id)) => {
+                client_order_id.as_str().to_string()
+            }
+            _ => request.order_id.0.clone(),
+        };
         let asset = self
             .metadata
             .read()
             .map_err(|_| HlBrokerError::StateUnavailable)?
-            .asset(&_request.coin)
+            .asset(&request.coin)
             .ok_or(HlBrokerError::StateUnavailable)?
             .asset_id;
-        let action = match _request.target {
+        let action = match request.target {
             Some(crate::hyperliquid::types::HlCancelTarget::ClientOrderId(cloid)) => {
                 HlExchangeAction::CancelByCloid(crate::hyperliquid::types::HlCancelByCloidAction {
                     cancels: vec![crate::hyperliquid::types::HlWireCancelByCloid {
                         asset,
                         client_order_id: cloid.as_str().to_string(),
                     }],
-                    fast: _request.fast,
+                    fast: request.fast,
                 })
             }
             _ => {
-                let oid = _request.order_id.0.parse::<u64>().map_err(|_| {
+                let oid = request.order_id.0.parse::<u64>().map_err(|_| {
                     HlBrokerError::InvalidRequest {
                         message: "Hyperliquid order id must be numeric".to_string(),
                     }
@@ -1186,12 +1401,12 @@ impl HyperliquidBroker for HyperliquidLiveBroker {
                         asset,
                         order_id: oid,
                     }],
-                    fast: _request.fast,
+                    fast: request.fast,
                 })
             }
         };
         let nonce = signer.next_nonce();
-        let expires_after = _request
+        let expires_after = request
             .expires_after
             .map(|value| value.timestamp_millis() as u64);
         let signed = signer
@@ -1205,16 +1420,31 @@ impl HyperliquidBroker for HyperliquidLiveBroker {
             .map_err(|error| HlBrokerError::Transport {
                 message: error.to_string(),
             })?;
+        {
+            let mut pending_cancels = self
+                .pending_cancels
+                .lock()
+                .map_err(|_| HlBrokerError::StateUnavailable)?;
+            if !pending_cancels.insert(target.clone()) {
+                return Err(HlBrokerError::InvalidRequest {
+                    message: format!("cancel outcome is pending for {target}"),
+                });
+            }
+        }
         let raw = ws
             .post(serde_json::json!({
                 "type": "action",
                 "payload": signed.to_exchange_payload(),
             }))
             .await
-            .map_err(|error| HlBrokerError::Transport {
-                message: error.to_string(),
+            .map_err(|_| HlBrokerError::CancelOutcomeUnknown {
+                target: target.clone(),
             })?;
-        parse_cancel_response(raw)
+        let result = parse_cancel_response(raw);
+        if let Ok(mut pending_cancels) = self.pending_cancels.lock() {
+            pending_cancels.remove(&target);
+        }
+        result
     }
 
     async fn close_position(
@@ -1433,6 +1663,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn live_broker_config_uses_safe_defaults() {
+        let config = HlLiveBrokerConfig::new(StrategyId::new("test"), Address::ZERO);
+
+        assert_eq!(config.network, HlNetwork::Testnet);
+        assert_eq!(
+            config.metadata_refresh_interval,
+            std::time::Duration::from_secs(60 * 60)
+        );
+        assert_eq!(config.connect_timeout, std::time::Duration::from_secs(10));
+        assert_eq!(config.freshness_max_age, std::time::Duration::from_secs(30));
+        assert_eq!(
+            config.reconciliation_interval,
+            std::time::Duration::from_secs(10)
+        );
+        assert!(config.markets.is_empty());
+        assert_eq!(config.default_market_slippage_bps, 100);
+        assert_eq!(config.default_close_slippage_bps, 100);
+    }
+
+    #[test]
     fn parses_filled_order_post_response() {
         let raw = serde_json::json!({
             "channel": "post",
@@ -1582,5 +1832,18 @@ mod tests {
             }
         }))
         .unwrap();
+    }
+
+    #[test]
+    fn parses_nested_order_status_for_reconciliation() {
+        let raw = serde_json::json!({
+            "status": "ok",
+            "response": {"data": {"orderStatus": "filled"}}
+        });
+
+        assert_eq!(
+            order_status_from_response(&raw),
+            Some(HlTrackedOrderState::Filled)
+        );
     }
 }

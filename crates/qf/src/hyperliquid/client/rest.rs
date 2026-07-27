@@ -8,6 +8,9 @@ use crate::hyperliquid::types::{
     HlOpenOrder, HlPosition,
 };
 
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 #[derive(Clone, Debug)]
 pub struct HyperliquidRestClient {
     pub base_url: String,
@@ -18,7 +21,11 @@ impl HyperliquidRestClient {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into(),
-            client: Client::new(),
+            client: Client::builder()
+                .connect_timeout(CONNECT_TIMEOUT)
+                .timeout(REQUEST_TIMEOUT)
+                .build()
+                .expect("valid Hyperliquid REST client configuration"),
         }
     }
 

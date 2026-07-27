@@ -21,6 +21,9 @@ pub enum HlBrokerError {
     #[error("request outcome is unknown for client order id {client_order_id:?}")]
     OutcomeUnknown { client_order_id: HlClientOrderId },
 
+    #[error("cancel outcome is unknown for {target}")]
+    CancelOutcomeUnknown { target: String },
+
     #[error("timed out waiting for terminal order state for {client_order_id:?}")]
     OrderWaitTimeout { client_order_id: HlClientOrderId },
 
