@@ -7,6 +7,7 @@ use alloy::sol;
 use alloy::sol_types::{SolStruct, eip712_domain};
 use serde::Serialize;
 
+use crate::hyperliquid::types::order::hyperliquid_decimal;
 use crate::hyperliquid::types::{
     HlCancelAction, HlCancelByCloidAction, HlExchangeAction, HlOrderAction, HlOrderType,
     HlSignature, HlSignedAction, HlTriggerExecution, HlUpdateLeverageAction,
@@ -110,6 +111,17 @@ pub struct HyperliquidSigner {
     next_nonce: AtomicU64,
 }
 
+/// L1 action 本地签名诊断结果，不包含私钥或私钥原文。
+#[derive(Clone, Debug)]
+pub struct HlSignatureDiagnostics {
+    pub nonce: u64,
+    pub action: serde_json::Value,
+    pub connection_id: B256,
+    pub digest: B256,
+    pub signature: HlSignature,
+    pub recovered_signer: Address,
+}
+
 impl std::fmt::Debug for HyperliquidSigner {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -177,6 +189,45 @@ impl HyperliquidSigner {
             },
             vault_address: vault_address.map(|address| format!("{address:?}")),
             expires_after,
+        })
+    }
+
+    /// 生成并本地恢复 L1 action 签名，仅用于诊断，不会发送网络请求。
+    pub fn diagnose_action(
+        &self,
+        action: &HlExchangeAction,
+        nonce: u64,
+        vault_address: Option<Address>,
+        expires_after: Option<u64>,
+        is_mainnet: bool,
+    ) -> anyhow::Result<HlSignatureDiagnostics> {
+        let action_bytes = action_msgpack(action)?;
+        let connection_id = action_hash(&action_bytes, nonce, vault_address, expires_after);
+        let source = if is_mainnet { "a" } else { "b" };
+        let agent = Agent {
+            source: source.to_string(),
+            connectionId: connection_id,
+        };
+        let domain = eip712_domain! {
+            name: "Exchange",
+            version: "1",
+            chain_id: 1337,
+            verifying_contract: Address::ZERO,
+        };
+        let digest = agent.eip712_signing_hash(&domain);
+        let signature = self.wallet.sign_hash_sync(&digest)?;
+        let recovered_signer = signature.recover_address_from_prehash(&digest)?;
+        Ok(HlSignatureDiagnostics {
+            nonce,
+            action: action.to_hyperliquid_json(),
+            connection_id,
+            digest,
+            signature: HlSignature {
+                r: format!("0x{:064x}", signature.r()),
+                s: format!("0x{:064x}", signature.s()),
+                v: 27 + signature.v() as u64,
+            },
+            recovered_signer,
         })
     }
 }
@@ -254,7 +305,7 @@ fn order_wire(order: &crate::hyperliquid::types::HlWireOrder) -> OrderWire {
         } => OrderTypeWire::Trigger {
             trigger: TriggerWire {
                 is_market: matches!(execution, HlTriggerExecution::Market { .. }),
-                trigger_px: trigger_price.to_string(),
+                trigger_px: hyperliquid_decimal(*trigger_price),
                 tpsl: trigger_kind.as_hyperliquid_str().to_string(),
             },
         },
@@ -262,8 +313,8 @@ fn order_wire(order: &crate::hyperliquid::types::HlWireOrder) -> OrderWire {
     OrderWire {
         a: order.asset.0,
         b: order.is_buy,
-        p: order.price.to_string(),
-        s: order.size.to_string(),
+        p: hyperliquid_decimal(order.price),
+        s: hyperliquid_decimal(order.size),
         r: order.reduce_only,
         t: order_type,
         c: order
@@ -319,7 +370,7 @@ mod tests {
     use rust_decimal::Decimal;
 
     #[test]
-    fn signs_official_rust_sdk_limit_order_vector() {
+    fn signs_canonical_hyperliquid_limit_order_vector() {
         let signer = HyperliquidSigner::from_private_key(
             "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e",
         )
@@ -344,11 +395,11 @@ mod tests {
             .unwrap();
         assert_eq!(
             signed.signature.r,
-            "0x77957e58e70f43b6b68581f2dc42011fc384538a2e5b7bf42d5b936f19fbb673"
+            "0xf99bde2cfc90712d0f154d76dc44d1b93b6cdf7ae2b10303030a37f4bdaaad4c"
         );
         assert_eq!(
             signed.signature.s,
-            "0x60721a8598727230f67080efee48c812a6a4442013fd3b0eed509171bef9f23f"
+            "0x73b773c43c925baf427c387231131624a071fc23935a6cb1dc99aa1e9710a8ec"
         );
         assert_eq!(signed.signature.v, 28);
 
@@ -357,7 +408,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             signed.signature.r,
-            "0xcd0925372ff1ed499e54883e9a6205ecfadec748f80ec463fe2f84f120964877"
+            "0x2b5aab4ffbe6eb62661eb38296a6295b606330230207f2512d54f20ed5504889"
         );
     }
 
@@ -378,5 +429,60 @@ mod tests {
         assert_ne!(base, with_vault);
         assert_ne!(base, with_expiration);
         assert_ne!(with_vault, with_expiration);
+    }
+
+    #[test]
+    fn diagnostics_recovers_the_derived_signer() {
+        let signer = HyperliquidSigner::from_private_key(
+            "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e",
+        )
+        .unwrap();
+        let action = HlExchangeAction::Cancel(HlCancelAction {
+            cancels: vec![],
+            fast: false,
+        });
+
+        let diagnostics = signer
+            .diagnose_action(&action, 1, None, None, true)
+            .unwrap();
+
+        assert_eq!(diagnostics.recovered_signer, signer.wallet_address());
+        assert_eq!(diagnostics.action["type"], "cancel");
+    }
+
+    #[test]
+    fn signs_order_wire_with_client_order_id() {
+        let action = HlExchangeAction::Order(HlOrderAction {
+            orders: vec![HlWireOrder {
+                asset: HlAssetId(0),
+                is_buy: true,
+                price: "0.070730".parse().unwrap(),
+                size: "158.000".parse().unwrap(),
+                reduce_only: false,
+                order_type: HlOrderType::Limit {
+                    limit_price: "0.070730".parse().unwrap(),
+                    tif: HlTimeInForce::Ioc,
+                },
+                client_order_id: Some(
+                    crate::hyperliquid::types::HlClientOrderId::new(
+                        "0x00000000000000000000000000000001",
+                    )
+                    .unwrap(),
+                ),
+            }],
+            grouping: HlOrderGrouping::Na,
+        });
+
+        let signed_wire: serde_json::Value =
+            rmp_serde::from_slice(&action_msgpack(&action).unwrap()).unwrap();
+        let exchange_wire = action.to_hyperliquid_json();
+
+        assert_eq!(signed_wire, exchange_wire);
+        assert_eq!(signed_wire["orders"][0]["p"], "0.07073");
+        assert_eq!(signed_wire["orders"][0]["s"], "158");
+        assert_eq!(
+            signed_wire["orders"][0]["c"],
+            "0x00000000000000000000000000000001"
+        );
     }
 }

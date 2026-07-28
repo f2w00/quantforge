@@ -10,6 +10,8 @@ pub enum AuditAction {
     ClosePosition,
     SetLeverage,
     ReconcileState,
+    Connect,
+    WebSocket,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

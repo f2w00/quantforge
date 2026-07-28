@@ -30,6 +30,9 @@ pub enum HlBrokerError {
     #[error("local broker state is unavailable or stale")]
     StateUnavailable,
 
+    #[error("local broker state is stale: {message}")]
+    StateStale { message: String },
+
     #[error("position is unavailable for {coin:?}")]
     PositionUnavailable { coin: HlCoin },
 }

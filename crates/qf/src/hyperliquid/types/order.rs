@@ -92,12 +92,17 @@ impl HlOrderType {
             } => json!({
                 "trigger": {
                     "isMarket": matches!(execution, HlTriggerExecution::Market { .. }),
-                    "triggerPx": trigger_price.to_string(),
+                    "triggerPx": hyperliquid_decimal(*trigger_price),
                     "tpsl": trigger_kind.as_hyperliquid_str(),
                 }
             }),
         }
     }
+}
+
+/// 与官方 SDK 的 float_to_wire 一致：限制 8 位小数并移除尾随零。
+pub fn hyperliquid_decimal(value: Decimal) -> String {
+    value.round_dp(8).normalize().to_string()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -341,8 +346,8 @@ impl HlWireOrder {
         let mut value = json!({
             "a": self.asset.0,
             "b": self.is_buy,
-            "p": self.price.to_string(),
-            "s": self.size.to_string(),
+            "p": hyperliquid_decimal(self.price),
+            "s": hyperliquid_decimal(self.size),
             "r": self.reduce_only,
             "t": self.order_type.to_hyperliquid_json(),
         });
@@ -515,6 +520,28 @@ mod tests {
                 "leverage": 5,
             })
         );
+    }
+
+    #[test]
+    fn serializes_order_numbers_as_canonical_hyperliquid_wire_values() {
+        let order = HlWireOrder {
+            asset: HlAssetId(0),
+            is_buy: true,
+            price: "0.070730".parse().unwrap(),
+            size: "158.000".parse().unwrap(),
+            reduce_only: false,
+            order_type: HlOrderType::Market {
+                max_slippage_bps: Some(100),
+            },
+            client_order_id: Some(
+                HlClientOrderId::new("0x00000000000000000000000000000001").unwrap(),
+            ),
+        };
+
+        let value = order.to_hyperliquid_json();
+
+        assert_eq!(value["p"], "0.07073");
+        assert_eq!(value["s"], "158");
     }
 }
 

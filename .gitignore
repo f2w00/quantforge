@@ -2,3 +2,4 @@
 .codegraph
 HANDOFF.md
 runs
+**/runtest.sh

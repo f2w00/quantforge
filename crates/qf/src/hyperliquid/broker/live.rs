@@ -4,35 +4,44 @@ use std::sync::{Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::Address;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use serde_json::Value;
 use tokio::sync::{mpsc, watch};
 
-use crate::audit::{AuditAction, AuditRecord, RunJournal};
-use crate::core::{Decimal, RunMode, StrategyId};
+use crate::audit::{AuditAction, AuditRecord, LedgerEvent, LedgerEventKind, RunJournal};
+use crate::core::{Decimal, RunMode, StrategyId, Timestamp};
 use crate::hyperliquid::broker::HlBrokerError;
 use crate::hyperliquid::broker::risk_adapter::order_risk_input_at_price;
 use crate::hyperliquid::broker::state::HlBrokerState;
 use crate::hyperliquid::broker::traits::HyperliquidBroker;
-use crate::hyperliquid::client::rest::{parse_ws_clearinghouse_state, parse_ws_open_orders};
-use crate::hyperliquid::client::ws::HyperliquidWsEvent;
-use crate::hyperliquid::client::{HyperliquidRestClient, HyperliquidSigner, HyperliquidWsClient};
+use crate::hyperliquid::client::rest::order_status_from_response;
+use crate::hyperliquid::client::ws::{
+    HyperliquidWsEvent, funding_events, non_funding_ledger_events, order_updates,
+    parse_cancel_response, parse_default_action_response, parse_order_outcome, user_fills,
+    ws_clearinghouse_state, ws_open_orders,
+};
+use crate::hyperliquid::client::{
+    HlOrderUpdate, HlUserFill, HyperliquidRestClient, HyperliquidSigner, HyperliquidWsClient,
+};
 use crate::hyperliquid::types::{
-    HlAccountState, HlCancelRequest, HlCancelResponse, HlCancelStatus, HlClientOrderId,
-    HlCloseRequest, HlCloseSize, HlCoin, HlExchangeAction, HlMetadataSnapshot, HlMidSnapshot,
-    HlOpenOrder, HlOrderOutcome, HlOrderRequest, HlOrderResult, HlOrderSize, HlOrderType,
-    HlSubmittedOrder, HlUpdateLeverageAction,
+    HlAccountState, HlCancelRequest, HlCancelResponse, HlClientOrderId, HlCloseRequest,
+    HlCloseSize, HlCoin, HlExchangeAction, HlMetadataSnapshot, HlMidSnapshot, HlOpenOrder,
+    HlOrderOutcome, HlOrderRequest, HlOrderResult, HlOrderSize, HlOrderType, HlSubmittedOrder,
+    HlUpdateLeverageAction,
 };
 use crate::risk::{RiskDecision, RiskGuard};
 
 const ACCOUNT_EVENT_HISTORY_LIMIT: usize = 1_000;
 const RECOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-const REQUIRED_SUBSCRIPTIONS: [&str; 5] = [
+const RECOVERY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+const REQUIRED_SUBSCRIPTIONS: [&str; 7] = [
     "allMids",
     "clearinghouseState",
     "openOrders",
     "orderUpdates",
     "userFills",
+    "userFundings",
+    "userNonFundingLedgerUpdates",
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,6 +62,13 @@ impl HlNetwork {
         match self {
             Self::Mainnet => "wss://api.hyperliquid.xyz/ws",
             Self::Testnet => "wss://api.hyperliquid-testnet.xyz/ws",
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Mainnet => "mainnet",
+            Self::Testnet => "testnet",
         }
     }
 }
@@ -123,25 +139,6 @@ pub struct HyperliquidLiveBroker {
     default_close_slippage_bps: u32,
 }
 
-#[derive(Clone, Debug)]
-pub struct HlOrderUpdate {
-    pub order_id: Option<String>,
-    pub client_order_id: Option<String>,
-    pub status: Option<String>,
-    pub raw: Value,
-}
-
-#[derive(Clone, Debug)]
-pub struct HlUserFill {
-    pub order_id: Option<String>,
-    pub client_order_id: Option<String>,
-    pub coin: Option<String>,
-    pub size: Option<crate::core::Decimal>,
-    pub price: Option<crate::core::Decimal>,
-    pub fee: Option<crate::core::Decimal>,
-    pub raw: Value,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HlTrackedOrderState {
     PendingSubmit,
@@ -187,35 +184,45 @@ impl HyperliquidLiveBroker {
         if config.default_market_slippage_bps >= 10_000
             || config.default_close_slippage_bps >= 10_000
         {
-            return Err(HlBrokerError::InvalidRequest {
+            let error = HlBrokerError::InvalidRequest {
                 message: "default slippage must be less than 10000 bps".to_string(),
-            });
+            };
+            Self::record_connection_error(&journal, &config.strategy_id, "validate_config", &error);
+            return Err(error);
         }
         let client = HyperliquidRestClient::new(config.network.rest_url());
         let user = format!("{:#x}", config.account_address);
         let signer_address = format!("{:#x}", signer.wallet_address());
-        let agent_owner = client
-            .agent_owner(&signer_address)
-            .await
-            .map_err(transport_error)?;
+        let agent_owner = client.agent_owner(&signer_address).await.map_err(|error| {
+            Self::connection_error(&journal, &config.strategy_id, "agent_owner", error)
+        })?;
         if agent_owner != config.account_address {
-            return Err(HlBrokerError::InvalidRequest {
+            let error = HlBrokerError::InvalidRequest {
                 message: format!(
                     "API wallet {signer_address} is authorized for {agent_owner:#x}, not \
                      configured account {user}"
                 ),
-            });
+            };
+            Self::record_connection_error(&journal, &config.strategy_id, "agent_owner", &error);
+            return Err(error);
         }
-        let metadata = client.meta().await.map_err(transport_error)?;
-        let mids = client.all_mids().await.map_err(transport_error)?;
-        let account = client
-            .clearinghouse_state(&user)
-            .await
-            .map_err(transport_error)?;
-        let open_orders = client.open_orders(&user).await.map_err(transport_error)?;
+        let metadata = client.meta().await.map_err(|error| {
+            Self::connection_error(&journal, &config.strategy_id, "metadata", error)
+        })?;
+        let mids = client.all_mids().await.map_err(|error| {
+            Self::connection_error(&journal, &config.strategy_id, "mids", error)
+        })?;
+        let account = client.clearinghouse_state(&user).await.map_err(|error| {
+            Self::connection_error(&journal, &config.strategy_id, "account", error)
+        })?;
+        let open_orders = client.open_orders(&user).await.map_err(|error| {
+            Self::connection_error(&journal, &config.strategy_id, "open_orders", error)
+        })?;
         let (ws, events) = HyperliquidWsClient::connect(config.network.ws_url())
             .await
-            .map_err(transport_error)?;
+            .map_err(|error| {
+                Self::connection_error(&journal, &config.strategy_id, "websocket", error)
+            })?;
         let broker = std::sync::Arc::new(Self::from_parts(
             config.strategy_id,
             journal,
@@ -241,22 +248,48 @@ impl HyperliquidLiveBroker {
             config.default_market_slippage_bps,
             config.default_close_slippage_bps,
         ));
+        broker.record_equity_snapshot();
 
-        broker
-            .ws
-            .subscribe_all_mids()
-            .await
-            .map_err(transport_error)?;
+        broker.ws.subscribe_all_mids().await.map_err(|error| {
+            Self::connection_error(
+                &broker.journal,
+                &broker.strategy_id,
+                "subscribe_all_mids",
+                error,
+            )
+        })?;
         broker
             .ws
             .subscribe_account_channels(&user)
             .await
-            .map_err(transport_error)?;
+            .map_err(|error| {
+                Self::connection_error(
+                    &broker.journal,
+                    &broker.strategy_id,
+                    "subscribe_account",
+                    error,
+                )
+            })?;
         let events = broker
             .wait_for_subscriptions(events, config.connect_timeout)
-            .await?;
+            .await
+            .map_err(|error| {
+                broker.record_audit(
+                    AuditAction::Connect,
+                    None,
+                    serde_json::json!({"stage": "subscription_confirmation", "error": Self::audit_error(&error)}),
+                );
+                error
+        })?;
         for market in &config.markets {
-            broker.set_leverage(market).await?;
+            broker.set_leverage(market).await.map_err(|error| {
+                broker.record_audit(
+                    AuditAction::Connect,
+                    Some(market.coin.0.clone()),
+                    serde_json::json!({"stage": "set_leverage", "error": Self::audit_error(&error)}),
+                );
+                error
+            })?;
         }
         broker.spawn_event_consumer(events);
         std::sync::Arc::clone(&broker).spawn_background_tasks(
@@ -366,7 +399,7 @@ impl HyperliquidLiveBroker {
                     }
                     Some("error") => {
                         return Err(HlBrokerError::Transport {
-                            message: format!("websocket subscription error: {message}"),
+                            message: "websocket subscription error".to_string(),
                         });
                     }
                     _ => self.apply_ws_event(message)?,
@@ -381,7 +414,7 @@ impl HyperliquidLiveBroker {
         if let Ok(mut subscriptions) = self.subscriptions.lock() {
             *subscriptions = expected;
         }
-        let _ = self.ws_ready.send(true);
+        self.ws_ready.send_replace(true);
         Ok(events)
     }
 
@@ -394,26 +427,54 @@ impl HyperliquidLiveBroker {
             while let Some(event) = events.recv().await {
                 match event {
                     HyperliquidWsEvent::Connected => {
-                        let _ = broker.ws_ready.send(false);
-                        if let Ok(mut subscriptions) = broker.subscriptions.lock() {
-                            subscriptions.clear();
-                        }
+                        broker.mark_ws_unavailable();
                     }
-                    HyperliquidWsEvent::Disconnected => broker.mark_ws_unavailable(),
+                    HyperliquidWsEvent::Disconnected => {
+                        broker.record_audit(
+                            AuditAction::WebSocket,
+                            None,
+                            serde_json::json!({
+                                "target": "connection",
+                                "error": {"outcome": "failed", "error": "websocket disconnected"},
+                            }),
+                        );
+                        broker.mark_ws_unavailable();
+                    }
                     HyperliquidWsEvent::Message(message) => {
-                        if broker.apply_ws_event(message.clone()).is_err() {
+                        if let Err(error) = broker.apply_ws_event(message.clone()) {
+                            let channel = message
+                                .get("channel")
+                                .and_then(Value::as_str)
+                                .unwrap_or("unknown");
+                            broker.record_audit(
+                                AuditAction::WebSocket,
+                                None,
+                                serde_json::json!({
+                                    "target": "event_processing",
+                                    "channel": channel,
+                                    "error": Self::audit_error(&error),
+                                }),
+                            );
                             let _ = broker.invalidate_event_freshness(&message);
                         }
                         broker.confirm_ws_recovery(&message);
                     }
                 }
             }
+            broker.record_audit(
+                AuditAction::WebSocket,
+                None,
+                serde_json::json!({
+                    "target": "event_channel",
+                    "error": {"outcome": "failed", "error": "websocket event channel closed"},
+                }),
+            );
             broker.mark_ws_unavailable();
         });
     }
 
     fn mark_ws_unavailable(&self) {
-        let _ = self.ws_ready.send(false);
+        self.ws_ready.send_replace(false);
         if let Ok(mut subscriptions) = self.subscriptions.lock() {
             subscriptions.clear();
         }
@@ -425,8 +486,174 @@ impl HyperliquidLiveBroker {
     }
 
     fn record_audit(&self, action: AuditAction, symbol: Option<String>, data: serde_json::Value) {
-        self.journal.record_audit(AuditRecord {
+        Self::record_audit_to_journal(&self.journal, &self.strategy_id, action, symbol, data);
+    }
+
+    fn order_audit_context(
+        &self,
+        request: &HlOrderRequest,
+        client_order_id: &HlClientOrderId,
+        submitted: Option<&HlSubmittedOrder>,
+    ) -> Value {
+        order_audit_context(
+            self.network,
+            format!("{:#x}", self.signer.wallet_address()),
+            &self.account_address,
+            request,
+            client_order_id,
+            submitted,
+        )
+    }
+
+    fn record_ledger(&self, event_id: String, timestamp: Timestamp, event: LedgerEventKind) {
+        self.journal.record_ledger(&LedgerEvent {
+            event_id,
             strategy_id: self.strategy_id.clone(),
+            mode: RunMode::Live,
+            exchange: "hyperliquid".to_string(),
+            timestamp,
+            event,
+        });
+    }
+
+    fn record_equity_snapshot(&self) {
+        let Ok(account) = self.state.read().map(|state| state.account.clone()) else {
+            self.record_invalid_ledger_event("equity_snapshot", "account state is unavailable");
+            return;
+        };
+        self.record_ledger(
+            format!("hl-equity-{}", account.updated_at.timestamp_millis()),
+            account.updated_at,
+            LedgerEventKind::EquitySnapshot {
+                equity: account.equity,
+                margin_used: account.margin_used,
+                realized_pnl: None,
+                unrealized_pnl: None,
+                trading_fees: None,
+                funding_pnl: None,
+            },
+        );
+    }
+
+    fn record_fill(&self, fill: &HlUserFill) {
+        let order = self.tracked_order_for_fill(fill);
+        let client_order_id = fill.client_order_id.clone().or_else(|| {
+            order
+                .as_ref()
+                .map(|(client_order_id, _)| client_order_id.as_str().to_string())
+        });
+        let reduce_only = order.map(|(_, order)| order.submitted.reduce_only);
+        match fill_ledger_event(fill, client_order_id, reduce_only) {
+            Ok((event_id, timestamp, event)) => self.record_ledger(event_id, timestamp, event),
+            Err(error) => self.record_invalid_ledger_event("fill", error),
+        }
+    }
+
+    fn tracked_order_for_fill(
+        &self,
+        fill: &HlUserFill,
+    ) -> Option<(HlClientOrderId, HlTrackedOrder)> {
+        let orders = self.orders.lock().ok()?;
+        if let Some(client_order_id) = fill.client_order_id.as_deref() {
+            let client_order_id = HlClientOrderId::new(client_order_id).ok()?;
+            return orders
+                .get(&client_order_id)
+                .map(|order| (client_order_id, order.clone()));
+        }
+        let order_id = fill.order_id.as_deref()?;
+        orders
+            .iter()
+            .find(|(_, order)| order.order_id.as_deref() == Some(order_id))
+            .map(|(client_order_id, order)| (client_order_id.clone(), order.clone()))
+    }
+
+    fn record_funding(&self, value: &Value) {
+        let Some(symbol) = string_field(value, &["coin"]) else {
+            self.record_invalid_ledger_event("funding", "missing coin");
+            return;
+        };
+        let (Some(cashflow), Some(timestamp)) = (
+            decimal_field(value, &["usdc"]),
+            timestamp_field(value, &["time"]),
+        ) else {
+            self.record_invalid_ledger_event("funding", "missing cashflow or timestamp");
+            return;
+        };
+        self.record_ledger(
+            format!("hl-funding-{}-{symbol}", timestamp.timestamp_millis()),
+            timestamp,
+            LedgerEventKind::Funding {
+                symbol,
+                funding_rate: decimal_field(value, &["fundingRate"]),
+                settlement_price: None,
+                cashflow,
+            },
+        );
+    }
+
+    fn record_liquidations(&self, value: &Value) {
+        let Some(delta) = value.get("delta") else {
+            return;
+        };
+        if delta.get("type").and_then(Value::as_str) != Some("liquidation") {
+            return;
+        }
+        let Some(timestamp) = timestamp_field(value, &["time"]) else {
+            self.record_invalid_ledger_event("liquidation", "missing timestamp");
+            return;
+        };
+        let Some(source) = string_field(value, &["hash"]) else {
+            self.record_invalid_ledger_event("liquidation", "missing source hash");
+            return;
+        };
+        let Some(positions) = delta.get("liquidatedPositions").and_then(Value::as_array) else {
+            self.record_invalid_ledger_event("liquidation", "missing liquidated positions");
+            return;
+        };
+        if positions.is_empty() {
+            self.record_invalid_ledger_event("liquidation", "missing liquidated positions");
+            return;
+        }
+        for (index, position) in positions.iter().enumerate() {
+            self.record_ledger(
+                format!(
+                    "hl-liquidation-{}-{source}-{index}",
+                    timestamp.timestamp_millis()
+                ),
+                timestamp,
+                LedgerEventKind::Liquidation {
+                    symbol: string_field(position, &["coin"]),
+                    size: decimal_field(position, &["szi"]).map(|size| size.abs()),
+                    price: None,
+                    realized_pnl: None,
+                    fee: None,
+                    reason: Some("exchange_liquidation".to_string()),
+                },
+            );
+        }
+    }
+
+    fn record_invalid_ledger_event(&self, target: &str, error: &str) {
+        self.record_audit(
+            AuditAction::WebSocket,
+            None,
+            serde_json::json!({
+                "target": "ledger_event",
+                "ledger_event": target,
+                "error": {"outcome": "failed", "error": error},
+            }),
+        );
+    }
+
+    fn record_audit_to_journal(
+        journal: &RunJournal,
+        strategy_id: &StrategyId,
+        action: AuditAction,
+        symbol: Option<String>,
+        data: serde_json::Value,
+    ) {
+        journal.record_audit(AuditRecord {
+            strategy_id: strategy_id.clone(),
             mode: RunMode::Live,
             exchange: "hyperliquid".to_string(),
             symbol,
@@ -435,14 +662,40 @@ impl HyperliquidLiveBroker {
         });
     }
 
+    fn record_connection_error(
+        journal: &RunJournal,
+        strategy_id: &StrategyId,
+        stage: &str,
+        error: &HlBrokerError,
+    ) {
+        Self::record_audit_to_journal(
+            journal,
+            strategy_id,
+            AuditAction::Connect,
+            None,
+            serde_json::json!({"stage": stage, "error": Self::audit_error(error)}),
+        );
+    }
+
+    fn connection_error(
+        journal: &RunJournal,
+        strategy_id: &StrategyId,
+        stage: &str,
+        error: impl std::fmt::Display,
+    ) -> HlBrokerError {
+        let error = transport_error(error);
+        Self::record_connection_error(journal, strategy_id, stage, &error);
+        error
+    }
+
     fn audit_error(error: &HlBrokerError) -> serde_json::Value {
         let outcome = match error {
             HlBrokerError::RiskRejected { .. }
             | HlBrokerError::InvalidRequest { .. }
             | HlBrokerError::ExchangeRejected { .. } => "rejected",
-            HlBrokerError::OutcomeUnknown { .. } | HlBrokerError::CancelOutcomeUnknown { .. } => {
-                "outcome_unknown"
-            }
+            HlBrokerError::OutcomeUnknown { .. }
+            | HlBrokerError::CancelOutcomeUnknown { .. }
+            | HlBrokerError::OrderWaitTimeout { .. } => "outcome_unknown",
             _ => "failed",
         };
         let mut value = serde_json::json!({
@@ -474,12 +727,14 @@ impl HyperliquidLiveBroker {
             return;
         };
         subscriptions.insert(subscription.to_string());
-        if REQUIRED_SUBSCRIPTIONS
-            .iter()
-            .all(|required| subscriptions.contains(*required))
-        {
-            let _ = self.ws_ready.send(true);
+    }
+
+    fn confirm_data_recovery(&self) -> Result<(), HlBrokerError> {
+        if !self.trading_data_is_fresh()? || *self.ws_ready.borrow() {
+            return Ok(());
         }
+        self.ws_ready.send_replace(true);
+        Ok(())
     }
 
     fn invalidate_event_freshness(&self, message: &Value) -> Result<(), HlBrokerError> {
@@ -495,36 +750,65 @@ impl HyperliquidLiveBroker {
         match message.get("channel").and_then(Value::as_str) {
             Some("allMids") => self.apply_mids_event(&message),
             Some("clearinghouseState") => {
-                let account = parse_ws_clearinghouse_state(&message).map_err(transport_error)?;
+                let account = ws_clearinghouse_state(&message).map_err(transport_error)?;
                 self.state
                     .write()
                     .map_err(|_| HlBrokerError::StateUnavailable)?
                     .account = account;
+                self.record_equity_snapshot();
                 self.mark_fresh(|freshness| freshness.account = Some(Utc::now()))?;
+                self.confirm_data_recovery()?;
                 Ok(())
             }
             Some("openOrders") => {
-                let open_orders = parse_ws_open_orders(&message).map_err(transport_error)?;
+                let open_orders = ws_open_orders(&message).map_err(transport_error)?;
                 self.state
                     .write()
                     .map_err(|_| HlBrokerError::StateUnavailable)?
                     .open_orders = open_orders;
                 self.confirm_pending_open_orders()?;
                 self.mark_fresh(|freshness| freshness.open_orders = Some(Utc::now()))?;
+                self.confirm_data_recovery()?;
                 Ok(())
             }
             Some("orderUpdates") => {
-                for value in event_values(&message) {
-                    let update = parse_order_update(&message, value);
+                for update in order_updates(&message) {
                     self.apply_order_update(&update)?;
                     push_bounded(&self.order_updates, update)?;
                 }
                 Ok(())
             }
             Some("userFills") => {
-                for value in event_values(&message) {
-                    push_bounded(&self.fills, parse_user_fill(&message, value))?;
+                for fill in user_fills(&message) {
+                    self.record_fill(&fill);
+                    push_bounded(&self.fills, fill)?;
                 }
+                Ok(())
+            }
+            Some("userFundings") => {
+                for value in funding_events(&message) {
+                    self.record_funding(&value);
+                }
+                Ok(())
+            }
+            Some("userNonFundingLedgerUpdates") => {
+                for value in non_funding_ledger_events(&message) {
+                    self.record_liquidations(&value);
+                }
+                Ok(())
+            }
+            Some("error") => {
+                self.record_audit(
+                    AuditAction::WebSocket,
+                    None,
+                    serde_json::json!({
+                        "target": "exchange_message",
+                        "error": {
+                            "outcome": "failed",
+                            "error": "received websocket error message",
+                        },
+                    }),
+                );
                 Ok(())
             }
             _ => Ok(()),
@@ -538,6 +822,7 @@ impl HyperliquidLiveBroker {
             .apply_ws_message(message)
             .map_err(transport_error)?;
         self.mark_fresh(|freshness| freshness.mids = Some(Utc::now()))
+            .and_then(|()| self.confirm_data_recovery())
     }
 
     fn mark_fresh(&self, update: impl FnOnce(&mut HlFreshness)) -> Result<(), HlBrokerError> {
@@ -563,35 +848,56 @@ impl HyperliquidLiveBroker {
     }
 
     fn trading_state_is_fresh(&self) -> Result<bool, HlBrokerError> {
+        Ok(self.trading_state_stale_message()?.is_none())
+    }
+
+    fn trading_data_is_fresh(&self) -> Result<bool, HlBrokerError> {
         let freshness = self
             .freshness
             .read()
             .map_err(|_| HlBrokerError::StateUnavailable)?
             .clone();
-        Ok(*self.ws_ready.borrow()
-            && self.is_fresh(freshness.mids)
-            && self.is_fresh(freshness.account)
-            && self.is_fresh(freshness.open_orders))
+        Ok(trading_data_is_fresh(
+            self.is_fresh(freshness.mids),
+            self.is_fresh(freshness.account),
+            self.is_fresh(freshness.open_orders),
+        ))
     }
 
-    async fn ensure_trading_state_fresh(&self) -> Result<(), HlBrokerError> {
+    fn trading_state_stale_message(&self) -> Result<Option<String>, HlBrokerError> {
+        let freshness = self
+            .freshness
+            .read()
+            .map_err(|_| HlBrokerError::StateUnavailable)?
+            .clone();
+        Ok(stale_state_message(
+            *self.ws_ready.borrow(),
+            self.is_fresh(freshness.mids),
+            self.is_fresh(freshness.account),
+            self.is_fresh(freshness.open_orders),
+        ))
+    }
+
+    pub async fn wait_until_trading_ready(&self) -> Result<(), HlBrokerError> {
         if self.trading_state_is_fresh()? {
             return Ok(());
         }
-        let mut ws_ready = self.ws_ready.subscribe();
         tokio::time::timeout(RECOVERY_TIMEOUT, async {
             loop {
                 if self.trading_state_is_fresh()? {
                     return Ok(());
                 }
-                ws_ready
-                    .changed()
-                    .await
-                    .map_err(|_| HlBrokerError::StateUnavailable)?;
+                tokio::time::sleep(RECOVERY_POLL_INTERVAL).await;
             }
         })
         .await
-        .map_err(|_| HlBrokerError::StateUnavailable)?
+        .map_err(|_| HlBrokerError::StateStale {
+            message: self
+                .trading_state_stale_message()
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "state could not be inspected".to_string()),
+        })?
     }
 
     pub async fn refresh_metadata(&self) -> Result<(), HlBrokerError> {
@@ -650,7 +956,14 @@ impl HyperliquidLiveBroker {
             loop {
                 ticker.tick().await;
                 if let Err(error) = metadata_broker.refresh_metadata().await {
-                    eprintln!("Hyperliquid metadata refresh failed: {error}");
+                    metadata_broker.record_audit(
+                        AuditAction::ReconcileState,
+                        None,
+                        serde_json::json!({
+                            "target": "metadata",
+                            "error": Self::audit_error(&error),
+                        }),
+                    );
                 }
             }
         });
@@ -664,10 +977,10 @@ impl HyperliquidLiveBroker {
                         if let Ok(mut state) = self.state.write() {
                             state.account = account;
                         }
+                        self.record_equity_snapshot();
                         let _ = self.mark_fresh(|freshness| freshness.account = Some(Utc::now()));
                     }
                     Err(error) => {
-                        eprintln!("Hyperliquid account reconciliation failed: {error}");
                         self.record_audit(
                             AuditAction::ReconcileState,
                             None,
@@ -685,13 +998,30 @@ impl HyperliquidLiveBroker {
                             state.open_orders = open_orders;
                         }
                         let _ = self.confirm_pending_open_orders();
-                        let _ = self.reconcile_unknown_orders().await;
-                        let _ = self.reconcile_pending_cancels().await;
+                        if let Err(error) = self.reconcile_unknown_orders().await {
+                            self.record_audit(
+                                AuditAction::ReconcileState,
+                                None,
+                                serde_json::json!({
+                                    "target": "unknown_orders",
+                                    "error": Self::audit_error(&error),
+                                }),
+                            );
+                        }
+                        if let Err(error) = self.reconcile_pending_cancels().await {
+                            self.record_audit(
+                                AuditAction::ReconcileState,
+                                None,
+                                serde_json::json!({
+                                    "target": "pending_cancels",
+                                    "error": Self::audit_error(&error),
+                                }),
+                            );
+                        }
                         let _ =
                             self.mark_fresh(|freshness| freshness.open_orders = Some(Utc::now()));
                     }
                     Err(error) => {
-                        eprintln!("Hyperliquid open-order reconciliation failed: {error}");
                         self.record_audit(
                             AuditAction::ReconcileState,
                             None,
@@ -752,7 +1082,7 @@ impl HyperliquidLiveBroker {
             .ok_or_else(|| HlBrokerError::InvalidRequest {
                 message: format!("unknown client order id {}", client_order_id.as_str()),
             })?;
-        tokio::time::timeout(timeout, async {
+        let result = tokio::time::timeout(timeout, async {
             loop {
                 let order = receiver.borrow().clone();
                 if order.state.is_terminal() {
@@ -767,7 +1097,22 @@ impl HyperliquidLiveBroker {
         .await
         .map_err(|_| HlBrokerError::OrderWaitTimeout {
             client_order_id: client_order_id.clone(),
-        })?
+        });
+        if let Err(error @ HlBrokerError::OrderWaitTimeout { .. }) = &result {
+            let symbol = self
+                .order(client_order_id)
+                .map(|order| order.submitted.coin.0);
+            self.record_audit(
+                AuditAction::PlaceOrder,
+                symbol,
+                serde_json::json!({
+                    "client_order_id": client_order_id.as_str(),
+                    "wait_timeout_ms": timeout.as_millis(),
+                    "error": Self::audit_error(error),
+                }),
+            );
+        }
+        result?
     }
 
     pub async fn set_leverage(&self, market: &HlMarketConfig) -> Result<(), HlBrokerError> {
@@ -841,7 +1186,8 @@ impl HyperliquidLiveBroker {
             }))
             .await
             .map_err(transport_error)?;
-        parse_default_action_response(raw)
+        parse_default_action_response(&raw)
+            .map_err(|message| HlBrokerError::ExchangeRejected { message, raw })
     }
 
     fn release_pending_notional(&self, client_order_id: &HlClientOrderId) {
@@ -897,7 +1243,8 @@ impl HyperliquidLiveBroker {
                 .ok()
                 .and_then(|notifiers| notifiers.get(client_order_id).cloned())
             {
-                let _ = sender.send(order);
+                // 订单可能在调用方开始等待前已终态，必须保留最新状态。
+                sender.send_replace(order);
             }
         }
     }
@@ -913,7 +1260,39 @@ impl HyperliquidLiveBroker {
             return Ok(());
         };
         if let Some(state) = update.status.as_deref().and_then(order_update_state) {
-            self.update_order_state(&client_order_id, state, update.order_id.clone(), None);
+            if self.order(&client_order_id).is_some() {
+                self.update_order_state(&client_order_id, state, update.order_id.clone(), None);
+            } else {
+                self.record_audit(
+                    AuditAction::WebSocket,
+                    None,
+                    serde_json::json!({
+                        "target": "order_update_association",
+                        "client_order_id": client_order_id.as_str(),
+                        "order_id": update.order_id,
+                        "status": update.status,
+                        "error": {
+                            "outcome": "failed",
+                            "error": "order update did not match a locally tracked order",
+                        },
+                    }),
+                );
+            }
+        } else if update.status.is_some() {
+            self.record_audit(
+                AuditAction::WebSocket,
+                None,
+                serde_json::json!({
+                    "target": "order_update_state",
+                    "client_order_id": client_order_id.as_str(),
+                    "order_id": update.order_id,
+                    "status": update.status,
+                    "error": {
+                        "outcome": "failed",
+                        "error": "unrecognized order update status",
+                    },
+                }),
+            );
         }
         Ok(())
     }
@@ -962,10 +1341,39 @@ impl HyperliquidLiveBroker {
                 );
                 continue;
             }
-            if let Ok(raw) = self.reconcile_order(&client_order_id).await
-                && let Some(status) = order_status_from_response(&raw)
-            {
-                self.update_order_state(&client_order_id, status, None, None);
+            match self.reconcile_order(&client_order_id).await {
+                Ok(raw) => {
+                    if let Some(status) = order_status_from_response(&raw)
+                        .as_deref()
+                        .and_then(order_update_state)
+                    {
+                        self.update_order_state(&client_order_id, status, None, None);
+                    } else {
+                        self.record_audit(
+                            AuditAction::ReconcileState,
+                            None,
+                            serde_json::json!({
+                                "target": "unknown_order",
+                                "client_order_id": client_order_id.as_str(),
+                                "error": {
+                                    "outcome": "failed",
+                                    "error": "order status response did not contain a recognized state",
+                                },
+                            }),
+                        );
+                    }
+                }
+                Err(error) => {
+                    self.record_audit(
+                        AuditAction::ReconcileState,
+                        None,
+                        serde_json::json!({
+                            "target": "unknown_order",
+                            "client_order_id": client_order_id.as_str(),
+                            "error": Self::audit_error(&error),
+                        }),
+                    );
+                }
             }
         }
         Ok(())
@@ -980,14 +1388,54 @@ impl HyperliquidLiveBroker {
             .cloned()
             .collect::<Vec<_>>();
         for target in pending_cancels {
-            let Ok(raw) = self.order_status(&target).await else {
-                continue;
+            let raw = match self.order_status(&target).await {
+                Ok(raw) => raw,
+                Err(error) => {
+                    self.record_audit(
+                        AuditAction::ReconcileState,
+                        None,
+                        serde_json::json!({
+                            "target": "pending_cancel",
+                            "order_target": target,
+                            "error": Self::audit_error(&error),
+                        }),
+                    );
+                    continue;
+                }
             };
-            let Some(state) = order_status_from_response(&raw) else {
+            let Some(state) = order_status_from_response(&raw)
+                .as_deref()
+                .and_then(order_update_state)
+            else {
+                self.record_audit(
+                    AuditAction::ReconcileState,
+                    None,
+                    serde_json::json!({
+                        "target": "pending_cancel",
+                        "order_target": target,
+                        "error": {
+                            "outcome": "failed",
+                            "error": "order status response did not contain a recognized state",
+                        },
+                    }),
+                );
                 continue;
             };
             if let Some(client_order_id) = self.client_order_id_for_target(&target) {
                 self.update_order_state(&client_order_id, state.clone(), None, None);
+            } else {
+                self.record_audit(
+                    AuditAction::ReconcileState,
+                    None,
+                    serde_json::json!({
+                        "target": "pending_cancel_association",
+                        "order_target": target,
+                        "error": {
+                            "outcome": "failed",
+                            "error": "order status did not match a locally tracked order",
+                        },
+                    }),
+                );
             }
             if state.is_terminal()
                 && let Ok(mut pending_cancels) = self.pending_cancels.lock()
@@ -1131,17 +1579,6 @@ fn push_bounded<T>(lock: &RwLock<Vec<T>>, value: T) -> Result<(), HlBrokerError>
     Ok(())
 }
 
-fn event_data(message: &Value) -> &Value {
-    message.get("data").unwrap_or(message)
-}
-
-fn event_values(message: &Value) -> Vec<&Value> {
-    match event_data(message) {
-        Value::Array(values) => values.iter().collect(),
-        value => vec![value],
-    }
-}
-
 fn string_field(value: &Value, names: &[&str]) -> Option<String> {
     names.iter().find_map(|name| {
         value.get(*name).and_then(|field| {
@@ -1153,29 +1590,62 @@ fn string_field(value: &Value, names: &[&str]) -> Option<String> {
     })
 }
 
-fn decimal_field(value: &Value, names: &[&str]) -> Option<crate::core::Decimal> {
-    string_field(value, names)?.parse().ok()
+fn decimal_field(value: &Value, names: &[&str]) -> Option<Decimal> {
+    names.iter().find_map(|name| {
+        value.get(*name).and_then(|field| {
+            field
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| field.is_number().then(|| field.to_string()))
+                .and_then(|value| value.parse().ok())
+        })
+    })
 }
 
-fn parse_order_update(message: &Value, value: &Value) -> HlOrderUpdate {
-    HlOrderUpdate {
-        order_id: string_field(value, &["oid", "orderId"]),
-        client_order_id: string_field(value, &["cloid", "clientOrderId"]),
-        status: string_field(value, &["status", "orderStatus"]),
-        raw: message.clone(),
-    }
+fn timestamp_field(value: &Value, names: &[&str]) -> Option<Timestamp> {
+    names.iter().find_map(|name| {
+        value
+            .get(*name)
+            .and_then(|field| {
+                field
+                    .as_i64()
+                    .or_else(|| field.as_u64().map(|value| value as i64))
+            })
+            .and_then(|millis| Utc.timestamp_millis_opt(millis).single())
+    })
 }
 
-fn parse_user_fill(message: &Value, value: &Value) -> HlUserFill {
-    HlUserFill {
-        order_id: string_field(value, &["oid", "orderId"]),
-        client_order_id: string_field(value, &["cloid", "clientOrderId"]),
-        coin: string_field(value, &["coin"]),
-        size: decimal_field(value, &["sz", "size"]),
-        price: decimal_field(value, &["px", "price"]),
-        fee: decimal_field(value, &["fee"]),
-        raw: message.clone(),
-    }
+fn fill_ledger_event(
+    fill: &HlUserFill,
+    client_order_id: Option<String>,
+    reduce_only: Option<bool>,
+) -> Result<(String, Timestamp, LedgerEventKind), &'static str> {
+    let symbol = fill.coin.clone().ok_or("missing coin")?;
+    let size = fill.size.ok_or("missing required fill fields")?;
+    let price = fill.price.ok_or("missing required fill fields")?;
+    let side = fill.side.ok_or("missing required fill fields")?;
+    let timestamp = fill.timestamp.ok_or("missing required fill fields")?;
+    let trade_id = fill
+        .trade_id
+        .as_ref()
+        .ok_or("missing required fill fields")?;
+    Ok((
+        format!(
+            "hl-fill-{}-{symbol}-{trade_id}",
+            timestamp.timestamp_millis()
+        ),
+        timestamp,
+        LedgerEventKind::Fill {
+            order_id: fill.order_id.clone(),
+            client_order_id,
+            symbol,
+            side,
+            size,
+            price,
+            fee: fill.fee,
+            reduce_only,
+        },
+    ))
 }
 
 fn order_update_state(status: &str) -> Option<HlTrackedOrderState> {
@@ -1191,19 +1661,6 @@ fn order_update_state(status: &str) -> Option<HlTrackedOrderState> {
     }
 }
 
-fn order_status_from_response(raw: &Value) -> Option<HlTrackedOrderState> {
-    match raw {
-        Value::Object(values) => values.iter().find_map(|(key, value)| {
-            (key == "status" || key == "orderStatus")
-                .then(|| value.as_str().and_then(order_update_state))
-                .flatten()
-                .or_else(|| order_status_from_response(value))
-        }),
-        Value::Array(values) => values.iter().find_map(order_status_from_response),
-        _ => None,
-    }
-}
-
 impl HyperliquidLiveBroker {
     async fn place_order_inner(
         &self,
@@ -1212,7 +1669,7 @@ impl HyperliquidLiveBroker {
         request
             .validate()
             .map_err(|message| HlBrokerError::InvalidRequest { message })?;
-        self.ensure_trading_state_fresh().await?;
+        self.wait_until_trading_ready().await?;
         if request
             .expires_after
             .is_some_and(|expires_after| expires_after <= Utc::now())
@@ -1343,10 +1800,18 @@ impl HyperliquidLiveBroker {
                 return Err(HlBrokerError::RiskRejected { violations });
             }
         }
+        let action = request.to_order_action(asset, price, normalized_size);
         self.register_order(submitted.clone())?;
+        let mut audit_data = self.order_audit_context(&request, &client_order_id, Some(&submitted));
+        audit_data["stage"] = serde_json::json!("submit_attempt");
+        audit_data["wire_action"] = action.to_hyperliquid_json();
+        self.record_audit(
+            AuditAction::PlaceOrder,
+            Some(request.coin.0.clone()),
+            audit_data,
+        );
         let signer = &self.signer;
         let ws = &self.ws;
-        let action = request.to_order_action(asset, price, normalized_size);
         let nonce = signer.next_nonce();
         let expires_after = request
             .expires_after
@@ -1389,16 +1854,20 @@ impl HyperliquidLiveBroker {
                     client_order_id: client_order_id.clone(),
                 }
             })?;
-        let result = match parse_order_result(raw, submitted) {
-            Ok(result) => result,
-            Err(error) => {
+        let result = match parse_order_outcome(&raw) {
+            Ok(outcome) => HlOrderResult {
+                submitted,
+                outcome,
+                raw,
+            },
+            Err(message) => {
                 self.update_order_state(
                     &client_order_id,
                     HlTrackedOrderState::Rejected,
                     None,
                     None,
                 );
-                return Err(error);
+                return Err(HlBrokerError::ExchangeRejected { message, raw });
             }
         };
         match &result.outcome {
@@ -1501,7 +1970,8 @@ impl HyperliquidLiveBroker {
             .map_err(|_| HlBrokerError::CancelOutcomeUnknown {
                 target: target.clone(),
             })?;
-        let result = parse_cancel_response(raw);
+        let result = parse_cancel_response(raw.clone())
+            .map_err(|message| HlBrokerError::ExchangeRejected { message, raw });
         if let Ok(mut pending_cancels) = self.pending_cancels.lock() {
             pending_cancels.remove(&target);
         }
@@ -1576,21 +2046,38 @@ impl HyperliquidBroker for HyperliquidLiveBroker {
     }
 
     async fn place_order(&self, request: HlOrderRequest) -> Result<HlOrderResult, HlBrokerError> {
-        let request_data = serde_json::to_value(&request).unwrap_or(serde_json::Value::Null);
+        let mut request = request;
+        if request.client_order_id.is_none() {
+            request.client_order_id = Some(self.next_client_order_id());
+        }
+        let client_order_id = request
+            .client_order_id
+            .clone()
+            .expect("client order id generated above");
         let symbol = Some(request.coin.0.clone());
-        let result = self.place_order_inner(request).await;
-        let data = match &result {
-            Ok(result) => serde_json::json!({
-                "request": request_data,
-                "outcome": "accepted",
-                "client_order_id": result.submitted.client_order_id.as_str(),
-                "response": result.raw,
-            }),
-            Err(error) => serde_json::json!({
-                "request": request_data,
-                "error": Self::audit_error(error),
-            }),
-        };
+        let result = self.place_order_inner(request.clone()).await;
+        let submitted = result
+            .as_ref()
+            .ok()
+            .map(|result| result.submitted.clone())
+            .or_else(|| self.order(&client_order_id).map(|order| order.submitted));
+        let mut data = self.order_audit_context(&request, &client_order_id, submitted.as_ref());
+        data["stage"] = serde_json::json!("submit_result");
+        match &result {
+            Ok(result) => {
+                data["outcome"] = serde_json::json!("accepted");
+                data["exchange_status"] = serde_json::json!(match &result.outcome {
+                    HlOrderOutcome::Resting { .. } => "resting",
+                    HlOrderOutcome::Filled { .. } => "filled",
+                });
+                data["response"] = result.raw.clone();
+            }
+            Err(error) => {
+                let audit_error = Self::audit_error(error);
+                data["exchange_status"] = audit_error["outcome"].clone();
+                data["error"] = audit_error;
+            }
+        }
         self.record_audit(AuditAction::PlaceOrder, symbol, data);
         result
     }
@@ -1641,169 +2128,107 @@ impl HyperliquidBroker for HyperliquidLiveBroker {
     }
 }
 
-fn parse_order_result(
-    raw: Value,
-    submitted: HlSubmittedOrder,
-) -> Result<HlOrderResult, HlBrokerError> {
-    let payload =
-        raw.pointer("/data/response/payload")
-            .ok_or_else(|| HlBrokerError::ExchangeRejected {
-                message: "missing websocket order response payload".to_string(),
-                raw: raw.clone(),
-            })?;
-    if payload.get("type").and_then(Value::as_str) == Some("error") {
-        return Err(HlBrokerError::ExchangeRejected {
-            message: payload
-                .get("payload")
-                .and_then(Value::as_str)
-                .unwrap_or("websocket action error")
-                .to_string(),
-            raw,
-        });
+fn stale_state_message(
+    ws_ready: bool,
+    mids_fresh: bool,
+    account_fresh: bool,
+    open_orders_fresh: bool,
+) -> Option<String> {
+    let mut stale = Vec::new();
+    if !ws_ready {
+        stale.push("websocket subscriptions");
     }
-    let data =
-        payload
-            .pointer("/response/data")
-            .ok_or_else(|| HlBrokerError::ExchangeRejected {
-                message: "missing websocket order response data".to_string(),
-                raw: raw.clone(),
-            })?;
-    let status = data
-        .get("statuses")
-        .and_then(Value::as_array)
-        .and_then(|statuses| statuses.first())
-        .ok_or_else(|| HlBrokerError::ExchangeRejected {
-            message: "missing websocket order status".to_string(),
-            raw: raw.clone(),
-        })?;
-    let outcome = if let Some(resting) = status.get("resting") {
-        HlOrderOutcome::Resting {
-            order_id: crate::core::OrderId::new(
-                resting
-                    .get("oid")
-                    .and_then(Value::as_u64)
-                    .ok_or_else(|| HlBrokerError::ExchangeRejected {
-                        message: "resting response is missing oid".to_string(),
-                        raw: raw.clone(),
-                    })?
-                    .to_string(),
-            ),
-        }
-    } else if let Some(filled) = status.get("filled") {
-        HlOrderOutcome::Filled {
-            order_id: crate::core::OrderId::new(
-                filled
-                    .get("oid")
-                    .and_then(Value::as_u64)
-                    .ok_or_else(|| HlBrokerError::ExchangeRejected {
-                        message: "filled response is missing oid".to_string(),
-                        raw: raw.clone(),
-                    })?
-                    .to_string(),
-            ),
-            total_size: filled
-                .get("totalSz")
-                .and_then(Value::as_str)
-                .ok_or_else(|| HlBrokerError::ExchangeRejected {
-                    message: "filled response is missing totalSz".to_string(),
-                    raw: raw.clone(),
-                })?
-                .parse()
-                .map_err(|_| HlBrokerError::ExchangeRejected {
-                    message: "invalid filled totalSz".to_string(),
-                    raw: raw.clone(),
-                })?,
-            avg_price: filled
-                .get("avgPx")
-                .and_then(Value::as_str)
-                .ok_or_else(|| HlBrokerError::ExchangeRejected {
-                    message: "filled response is missing avgPx".to_string(),
-                    raw: raw.clone(),
-                })?
-                .parse()
-                .map_err(|_| HlBrokerError::ExchangeRejected {
-                    message: "invalid filled avgPx".to_string(),
-                    raw: raw.clone(),
-                })?,
-        }
-    } else if let Some(message) = status.get("error").and_then(Value::as_str) {
-        return Err(HlBrokerError::ExchangeRejected {
-            message: message.to_string(),
-            raw,
-        });
-    } else {
-        return Err(HlBrokerError::ExchangeRejected {
-            message: "unsupported websocket order status".to_string(),
-            raw,
-        });
-    };
-    Ok(HlOrderResult {
-        submitted,
-        outcome,
-        raw,
+    if !mids_fresh {
+        stale.push("market mids");
+    }
+    if !account_fresh {
+        stale.push("account state");
+    }
+    if !open_orders_fresh {
+        stale.push("open orders");
+    }
+    (!stale.is_empty()).then(|| stale.join(", "))
+}
+
+fn order_audit_context(
+    network: HlNetwork,
+    signer_address: String,
+    account_address: &str,
+    request: &HlOrderRequest,
+    client_order_id: &HlClientOrderId,
+    submitted: Option<&HlSubmittedOrder>,
+) -> Value {
+    serde_json::json!({
+        "network": network.name(),
+        "signer_address": signer_address,
+        "account_address": account_address,
+        "client_order_id": client_order_id.as_str(),
+        "request": request,
+        "submitted": submitted.map(|order| serde_json::json!({
+            "symbol": order.coin.0.clone(),
+            "side": order.side,
+            "size": order.size,
+            "price": order.limit_price,
+            "reduce_only": order.reduce_only,
+        })),
     })
 }
 
-fn parse_default_action_response(raw: Value) -> Result<(), HlBrokerError> {
-    let payload = raw.pointer("/data/response/payload").unwrap_or(&raw);
-    if payload.get("status").and_then(Value::as_str) == Some("ok")
-        && payload.pointer("/response/type").and_then(Value::as_str) == Some("default")
-    {
-        return Ok(());
-    }
-    if payload.get("type").and_then(Value::as_str) == Some("error") {
-        return Err(HlBrokerError::ExchangeRejected {
-            message: payload
-                .get("payload")
-                .and_then(Value::as_str)
-                .unwrap_or("exchange action error")
-                .to_string(),
-            raw,
-        });
-    }
-    Err(HlBrokerError::ExchangeRejected {
-        message: "unexpected update leverage response".to_string(),
-        raw,
-    })
-}
-
-fn parse_cancel_response(raw: Value) -> Result<HlCancelResponse, HlBrokerError> {
-    let statuses = raw
-        .pointer("/data/response/payload/response/data/statuses")
-        .and_then(Value::as_array)
-        .ok_or_else(|| HlBrokerError::ExchangeRejected {
-            message: "missing websocket cancel response statuses".to_string(),
-            raw: raw.clone(),
-        })?;
-    let statuses = statuses
-        .iter()
-        .map(|status| {
-            if status.as_str() == Some("success") {
-                HlCancelStatus::Success
-            } else if let Some(message) = status.get("error").and_then(Value::as_str) {
-                HlCancelStatus::Error {
-                    message: message.to_string(),
-                }
-            } else {
-                HlCancelStatus::Error {
-                    message: "unsupported websocket cancel status".to_string(),
-                }
-            }
-        })
-        .collect::<Vec<_>>();
-    let success = statuses
-        .iter()
-        .all(|status| matches!(status, HlCancelStatus::Success));
-    Ok(HlCancelResponse {
-        success,
-        statuses,
-        raw,
-    })
+fn trading_data_is_fresh(mids_fresh: bool, account_fresh: bool, open_orders_fresh: bool) -> bool {
+    mids_fresh && account_fresh && open_orders_fresh
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::JournalId;
+    use crate::core::Side;
+    use crate::hyperliquid::client::ws::{
+        event_values, funding_events, non_funding_ledger_events, parse_order_outcome,
+        parse_order_update, user_fills,
+    };
+    use crate::hyperliquid::types::HlCancelStatus;
+    use crate::storage::{MemoryAuditSink, MemoryLedgerSink};
+
+    #[test]
+    fn records_connection_errors_with_stage_and_outcome() {
+        let audit = MemoryAuditSink::new();
+        let reader = audit.clone();
+        let journal = RunJournal::new(JournalId::new("live-1"), MemoryLedgerSink::new())
+            .with_audit_sink(audit);
+        let error = HlBrokerError::Transport {
+            message: "connection refused".to_string(),
+        };
+
+        HyperliquidLiveBroker::record_connection_error(
+            &journal,
+            &StrategyId::new("strategy-1"),
+            "websocket",
+            &error,
+        );
+
+        let events = reader.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].record.action, AuditAction::Connect);
+        assert_eq!(events[0].record.data["stage"], "websocket");
+        assert_eq!(events[0].record.data["error"]["outcome"], "failed");
+        assert_eq!(
+            events[0].record.data["error"]["error"],
+            "transport failed: connection refused"
+        );
+    }
+
+    #[test]
+    fn classifies_order_wait_timeout_as_unknown_for_audit() {
+        let error = HlBrokerError::OrderWaitTimeout {
+            client_order_id: HlClientOrderId::new("0x00000000000000000000000000000001").unwrap(),
+        };
+
+        assert_eq!(
+            HyperliquidLiveBroker::audit_error(&error)["outcome"],
+            "outcome_unknown"
+        );
+    }
 
     #[test]
     fn live_broker_config_uses_safe_defaults() {
@@ -1823,6 +2248,73 @@ mod tests {
         assert!(config.markets.is_empty());
         assert_eq!(config.default_market_slippage_bps, 100);
         assert_eq!(config.default_close_slippage_bps, 100);
+    }
+
+    #[test]
+    fn order_audit_context_records_replayable_order_identity_without_signature_material() {
+        let client_order_id = HlClientOrderId::new("0x00000000000000000000000000000001").unwrap();
+        let request = HlOrderRequest {
+            coin: HlCoin::new("DOGE"),
+            side: Side::Buy,
+            size: HlOrderSize::Exact("12.3456".parse().unwrap()),
+            reduce_only: false,
+            order_type: HlOrderType::Limit {
+                limit_price: "0.123456".parse().unwrap(),
+                tif: crate::hyperliquid::types::HlTimeInForce::Ioc,
+            },
+            client_order_id: Some(client_order_id.clone()),
+            expires_after: None,
+        };
+        let submitted = HlSubmittedOrder {
+            coin: HlCoin::new("DOGE"),
+            side: Side::Buy,
+            size: "12.34".parse().unwrap(),
+            limit_price: "0.12346".parse().unwrap(),
+            reduce_only: false,
+            client_order_id: client_order_id.clone(),
+        };
+
+        let context = order_audit_context(
+            HlNetwork::Mainnet,
+            "0x0000000000000000000000000000000000000001".to_string(),
+            "0x0000000000000000000000000000000000000002",
+            &request,
+            &client_order_id,
+            Some(&submitted),
+        );
+
+        assert_eq!(context["network"], "mainnet");
+        assert_eq!(context["client_order_id"], client_order_id.as_str());
+        assert_eq!(
+            context["signer_address"],
+            "0x0000000000000000000000000000000000000001"
+        );
+        assert_eq!(context["submitted"]["symbol"], "DOGE");
+        assert_eq!(context["submitted"]["size"], "12.34");
+        assert_eq!(context["submitted"]["price"], "0.12346");
+        assert!(context.get("nonce").is_none());
+        assert!(context.get("signature").is_none());
+    }
+
+    #[test]
+    fn identifies_each_stale_trading_state_component() {
+        assert_eq!(stale_state_message(true, true, true, true), None);
+        assert_eq!(
+            stale_state_message(false, false, false, false).as_deref(),
+            Some("websocket subscriptions, market mids, account state, open orders")
+        );
+        assert_eq!(
+            stale_state_message(true, false, true, false).as_deref(),
+            Some("market mids, open orders")
+        );
+    }
+
+    #[test]
+    fn reconnect_requires_all_trading_snapshots_but_not_order_event_channels() {
+        assert!(!trading_data_is_fresh(false, true, true));
+        assert!(!trading_data_is_fresh(true, false, true));
+        assert!(!trading_data_is_fresh(true, true, false));
+        assert!(trading_data_is_fresh(true, true, true));
     }
 
     #[test]
@@ -1851,24 +2343,68 @@ mod tests {
                 }
             }
         });
-        let result = parse_order_result(
-            raw,
-            HlSubmittedOrder {
-                coin: HlCoin::new("ETH"),
-                side: crate::core::Side::Buy,
-                size: "0.02".parse().unwrap(),
-                limit_price: "1900".parse().unwrap(),
-                reduce_only: false,
-                client_order_id: HlClientOrderId::new("0x0123456789abcdef0123456789abcdef")
-                    .unwrap(),
-            },
-        )
-        .unwrap();
+        let result = parse_order_outcome(&raw)
+            .map(|outcome| HlOrderResult {
+                submitted: HlSubmittedOrder {
+                    coin: HlCoin::new("ETH"),
+                    side: crate::core::Side::Buy,
+                    size: "0.02".parse().unwrap(),
+                    limit_price: "1900".parse().unwrap(),
+                    reduce_only: false,
+                    client_order_id: HlClientOrderId::new("0x0123456789abcdef0123456789abcdef")
+                        .unwrap(),
+                },
+                outcome,
+                raw,
+            })
+            .unwrap();
         assert!(matches!(
             result.outcome,
             HlOrderOutcome::Filled { total_size, .. }
                 if total_size == "0.02".parse().unwrap()
         ));
+    }
+
+    #[test]
+    fn parses_direct_order_post_response_data() {
+        let raw = serde_json::json!({
+            "data": {
+                "response": {
+                    "payload": {
+                        "data": {
+                            "statuses": [{
+                                "resting": {"oid": 42}
+                            }]
+                        }
+                    }
+                }
+            }
+        });
+        let result = parse_order_outcome(&raw).unwrap();
+
+        assert!(matches!(
+            result,
+            HlOrderOutcome::Resting { order_id } if order_id.0 == "42"
+        ));
+    }
+
+    #[test]
+    fn preserves_exchange_error_response_text() {
+        let raw = serde_json::json!({
+            "channel": "post",
+            "data": {
+                "response": {
+                    "type": "action",
+                    "payload": {
+                        "status": "err",
+                        "response": "User or API Wallet 0xdead does not exist."
+                    }
+                }
+            }
+        });
+        let error = parse_order_outcome(&raw).unwrap_err();
+
+        assert_eq!(error, "User or API Wallet 0xdead does not exist.");
     }
 
     #[test]
@@ -1908,19 +2444,198 @@ mod tests {
         let message = serde_json::json!({
             "channel": "userFills",
             "data": {
-                "oid": 42,
-                "cloid": "0xabc",
-                "coin": "BTC",
-                "sz": "0.1",
-                "px": "100.5",
-                "fee": "0.01"
+                "fills": [{
+                    "oid": 42,
+                    "cloid": "0xabc",
+                    "coin": "BTC",
+                    "side": "B",
+                    "sz": "0.1",
+                    "px": "100.5",
+                    "fee": "0.01",
+                    "time": 1_700_000_000_000_i64,
+                    "tid": 99
+                }]
             }
         });
-        let fill = parse_user_fill(&message, event_data(&message));
+        let fill = user_fills(&message).remove(0);
         assert_eq!(fill.order_id.as_deref(), Some("42"));
         assert_eq!(fill.coin.as_deref(), Some("BTC"));
         assert_eq!(fill.size, Some("0.1".parse().unwrap()));
+        assert_eq!(fill.side, Some(Side::Buy));
+        assert_eq!(fill.trade_id.as_deref(), Some("99"));
         assert_eq!(fill.raw, message);
+    }
+
+    #[test]
+    fn extracts_nested_fill_and_funding_events() {
+        let fills = serde_json::json!({
+            "data": {"fills": [{"coin": "BTC"}]}
+        });
+        let fundings = serde_json::json!({
+            "data": {"fundings": [{"coin": "ETH"}]}
+        });
+
+        assert_eq!(user_fills(&fills).len(), 1);
+        assert_eq!(funding_events(&fundings).len(), 1);
+        assert_eq!(user_fills(&fills)[0].coin.as_deref(), Some("BTC"));
+        assert_eq!(funding_events(&fundings)[0]["coin"], "ETH");
+
+        let ledger_updates = serde_json::json!({
+            "data": {"nonFundingLedgerUpdates": [{"hash": "0x1"}]}
+        });
+        assert_eq!(non_funding_ledger_events(&ledger_updates).len(), 1);
+    }
+
+    #[test]
+    fn parses_fill_timestamp_and_side() {
+        let fill = serde_json::json!({
+            "side": "A",
+            "time": 1_700_000_000_000_i64,
+        });
+
+        let parsed = user_fills(&serde_json::json!({"data": {"fills": [fill]}}));
+        assert_eq!(parsed[0].side, Some(Side::Sell));
+        assert_eq!(
+            parsed[0].timestamp.unwrap().timestamp_millis(),
+            1_700_000_000_000_i64
+        );
+    }
+
+    #[test]
+    fn parses_decimal_json_numbers_for_exchange_liquidations() {
+        let liquidation = serde_json::json!({"szi": 0.125});
+
+        assert_eq!(
+            decimal_field(&liquidation, &["szi"]),
+            Some("0.125".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn converts_exchange_fill_to_stable_ledger_event() {
+        let timestamp = Utc
+            .timestamp_millis_opt(1_700_000_000_000_i64)
+            .single()
+            .unwrap();
+        let fill = HlUserFill {
+            order_id: Some("42".to_string()),
+            client_order_id: Some("0x00000000000000000000000000000001".to_string()),
+            coin: Some("BTC".to_string()),
+            size: Some("0.1".parse().unwrap()),
+            price: Some("100.5".parse().unwrap()),
+            fee: Some("0.01".parse().unwrap()),
+            side: Some(Side::Buy),
+            timestamp: Some(timestamp),
+            trade_id: Some("99".to_string()),
+            raw: serde_json::Value::Null,
+        };
+
+        let (event_id, event_timestamp, event) =
+            fill_ledger_event(&fill, fill.client_order_id.clone(), Some(false)).unwrap();
+
+        assert_eq!(event_id, "hl-fill-1700000000000-BTC-99");
+        assert_eq!(event_timestamp, timestamp);
+        assert!(matches!(
+            event,
+            LedgerEventKind::Fill {
+                ref symbol,
+                side: Side::Buy,
+                size,
+                price,
+                fee: Some(fee),
+                reduce_only: Some(false),
+                ..
+            } if symbol == "BTC"
+                && size == "0.1".parse().unwrap()
+                && price == "100.5".parse().unwrap()
+                && fee == "0.01".parse().unwrap()
+        ));
+    }
+
+    #[test]
+    fn fills_can_use_order_association_when_the_exchange_omits_cloid() {
+        let fill = HlUserFill {
+            order_id: Some("42".to_string()),
+            client_order_id: None,
+            coin: Some("BTC".to_string()),
+            size: Some(Decimal::ONE),
+            price: Some(Decimal::from(100)),
+            fee: None,
+            side: Some(Side::Buy),
+            timestamp: Some(
+                Utc.timestamp_millis_opt(1_700_000_000_000_i64)
+                    .single()
+                    .unwrap(),
+            ),
+            trade_id: Some("99".to_string()),
+            raw: serde_json::Value::Null,
+        };
+        let client_order_id = "0x00000000000000000000000000000001".to_string();
+
+        let (_, _, event) =
+            fill_ledger_event(&fill, Some(client_order_id.clone()), Some(true)).unwrap();
+
+        assert!(matches!(
+            event,
+            LedgerEventKind::Fill {
+                client_order_id: Some(ref value),
+                reduce_only: Some(true),
+                ..
+            } if value == &client_order_id
+        ));
+    }
+
+    #[test]
+    fn parses_nested_websocket_order_updates() {
+        let message = serde_json::json!({
+            "channel": "orderUpdates",
+            "data": [{
+                "order": {
+                    "cloid": "0x00000000000000000000019fa823f0d4",
+                    "oid": 504208918599_u64,
+                },
+                "status": "filled",
+            }]
+        });
+        let update = parse_order_update(&message, event_values(&message)[0]);
+
+        assert_eq!(update.order_id.as_deref(), Some("504208918599"));
+        assert_eq!(
+            update.client_order_id.as_deref(),
+            Some("0x00000000000000000000019fa823f0d4")
+        );
+        assert_eq!(update.status.as_deref(), Some("filled"));
+    }
+
+    #[test]
+    fn order_notifier_retains_terminal_state_without_a_receiver() {
+        let pending = HlTrackedOrder {
+            submitted: HlSubmittedOrder {
+                coin: HlCoin::new("DOGE"),
+                side: crate::core::Side::Buy,
+                size: "1".parse().unwrap(),
+                limit_price: "0.1".parse().unwrap(),
+                reduce_only: false,
+                client_order_id: HlClientOrderId::new("0x00000000000000000000000000000001")
+                    .unwrap(),
+            },
+            order_id: None,
+            filled_size: Decimal::ZERO,
+            state: HlTrackedOrderState::PendingSubmit,
+        };
+        let (sender, _) = watch::channel(pending);
+        let filled = HlTrackedOrder {
+            order_id: Some("42".to_string()),
+            filled_size: "1".parse().unwrap(),
+            state: HlTrackedOrderState::Filled,
+            ..sender.borrow().clone()
+        };
+
+        sender.send_replace(filled);
+        let receiver = sender.subscribe();
+
+        assert!(receiver.borrow().state.is_terminal());
+        assert_eq!(receiver.borrow().order_id.as_deref(), Some("42"));
     }
 
     #[test]
@@ -1954,16 +2669,16 @@ mod tests {
 
     #[test]
     fn parses_update_leverage_response() {
-        parse_default_action_response(serde_json::json!({
+        let raw = serde_json::json!({
             "status": "ok",
             "response": {"type": "default"}
-        }))
-        .unwrap();
+        });
+        parse_default_action_response(&raw).unwrap();
     }
 
     #[test]
     fn parses_websocket_update_leverage_response() {
-        parse_default_action_response(serde_json::json!({
+        let raw = serde_json::json!({
             "channel": "post",
             "data": {
                 "response": {
@@ -1973,8 +2688,8 @@ mod tests {
                     }
                 }
             }
-        }))
-        .unwrap();
+        });
+        parse_default_action_response(&raw).unwrap();
     }
 
     #[test]
@@ -1984,9 +2699,6 @@ mod tests {
             "response": {"data": {"orderStatus": "filled"}}
         });
 
-        assert_eq!(
-            order_status_from_response(&raw),
-            Some(HlTrackedOrderState::Filled)
-        );
+        assert_eq!(order_status_from_response(&raw), Some("filled".to_string()));
     }
 }

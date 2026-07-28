@@ -86,6 +86,15 @@ impl HyperliquidRestClient {
         parse_agent_owner(agent, response)
     }
 
+    /// 查询交易所记录的地址角色，用于只读诊断。
+    pub async fn user_role(&self, user: &str) -> anyhow::Result<serde_json::Value> {
+        self.info(serde_json::json!({
+            "type": "userRole",
+            "user": user,
+        }))
+        .await
+    }
+
     pub async fn exchange(&self, payload: serde_json::Value) -> anyhow::Result<serde_json::Value> {
         let url = format!("{}/exchange", self.base_url.trim_end_matches('/'));
         Ok(self
@@ -280,6 +289,19 @@ pub(crate) fn parse_ws_open_orders(
         .into_iter()
         .map(TryInto::try_into)
         .collect()
+}
+
+pub(crate) fn order_status_from_response(raw: &serde_json::Value) -> Option<String> {
+    match raw {
+        serde_json::Value::Object(values) => values.iter().find_map(|(key, value)| {
+            (key == "status" || key == "orderStatus")
+                .then(|| value.as_str().map(str::to_string))
+                .flatten()
+                .or_else(|| order_status_from_response(value))
+        }),
+        serde_json::Value::Array(values) => values.iter().find_map(order_status_from_response),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
