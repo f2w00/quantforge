@@ -1,0 +1,12 @@
+[package]
+name = "example-strategy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+alloy.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+qf = { path = "../../crates/qf" }
+tokio.workspace = true

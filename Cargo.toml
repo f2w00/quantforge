@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/qf",
+    "strategies/example",
 ]
 resolver = "2"
 
