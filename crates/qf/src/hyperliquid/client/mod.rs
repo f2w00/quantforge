@@ -4,4 +4,4 @@ pub mod ws;
 
 pub use rest::HyperliquidRestClient;
 pub use signer::{HlSignatureDiagnostics, HyperliquidSigner};
-pub use ws::{HlOrderUpdate, HlUserFill, HyperliquidWsClient};
+pub use ws::{HlOrderUpdate, HlUserFill, HyperliquidWsClient, HyperliquidWsEvent};

@@ -48,7 +48,8 @@ pub struct HlUserFill {
     pub raw: Value,
 }
 
-pub(crate) fn ws_clearinghouse_state(message: &Value) -> anyhow::Result<HlAccountState> {
+/// 解析账户仓位 WebSocket 快照，供只读账户监控策略复用。
+pub fn ws_clearinghouse_state(message: &Value) -> anyhow::Result<HlAccountState> {
     parse_ws_clearinghouse_state(message)
 }
 

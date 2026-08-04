@@ -51,14 +51,14 @@ pub enum HlNetwork {
 }
 
 impl HlNetwork {
-    fn rest_url(self) -> &'static str {
+    pub fn rest_url(self) -> &'static str {
         match self {
             Self::Mainnet => "https://api.hyperliquid.xyz",
             Self::Testnet => "https://api.hyperliquid-testnet.xyz",
         }
     }
 
-    fn ws_url(self) -> &'static str {
+    pub fn ws_url(self) -> &'static str {
         match self {
             Self::Mainnet => "wss://api.hyperliquid.xyz/ws",
             Self::Testnet => "wss://api.hyperliquid-testnet.xyz/ws",

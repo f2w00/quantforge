@@ -2,6 +2,7 @@
 members = [
     "crates/qf",
     "strategies/example",
+    "strategies/yessir",
 ]
 resolver = "2"
 
@@ -24,3 +25,4 @@ serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
+toml = "0.8"
