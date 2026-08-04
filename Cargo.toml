@@ -3,7 +3,6 @@ members = [
     "crates/qf",
     "strategies/example",
     "strategies/follow-sar",
-    "strategies/mm-linkage",
     "strategies/yessir",
 ]
 resolver = "2"

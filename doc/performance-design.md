@@ -52,10 +52,12 @@ let report = PerformanceReport::from_events(events);
 主要指标包括：
 
 - 权益：期初权益、期末权益、总 PnL、总收益率。
-- PnL：已实现 PnL、未实现 PnL、交易手续费、资金费。
+- 交易活动：成交笔数、买卖成交数、开平仓生命周期数、成交量、成交额和成交频率。
+- 成本：交易手续费、手续费完整性、资金费收支、净成本和费率。
+- PnL：已实现 PnL、未实现 PnL、资金费。
 - 交易：完整已平仓交易数、胜/负/平次数、胜率、平均盈亏、Profit Factor、Expectancy。
 - 风险：最大回撤金额、最大回撤比例和清算次数。
-- 数据质量：有效账本事件数、去重数量、缺失手续费数量和权益快照可用性。
+- 数据质量：有效账本事件数、去重数量和权益快照可用性；手续费完整性由 `costs` 提供。
 
 `Option` 表示无法计算或来源未提供，不能用零替代。例如没有权益快照时，权益、总收益和回撤
 相关指标为 `None`；没有输单时，`average_loss` 和 `profit_factor` 为 `None`。
@@ -86,7 +88,7 @@ realized_pnl + funding_pnl - fees
 其中成交手续费会随该生命周期累积；反手成交的手续费按平仓量与新开仓量分摊。资金费发生时归属到
 当时同标的的活跃仓位。胜、负、平以该净值分别大于、少于、等于零判定。
 
-账户级的 `realized_pnl`、`trading_fees` 和 `funding_pnl` 在 `EquitySnapshot` 提供时，以最后一个
+账户级的 `realized_pnl`、`costs.trading_fees` 和 `funding_pnl` 在 `EquitySnapshot` 提供时，以最后一个
 快照中的累计值为准；没有快照时，以账本回放的累计值为准。`total_pnl` 和 `total_return` 始终由
 首末权益快照计算：
 
@@ -112,7 +114,23 @@ Sharpe、Sortino 或年化指标。
 ## 数据质量
 
 `Fill.fee = None` 或 `Liquidation.fee = None` 的含义是来源未提供手续费，而不是手续费为零。报告会
-继续输出已知数据，但递增 `missing_fee_count`；费后胜率、Profit Factor 和 Expectancy 因此可能不完整。
+继续输出已知数据，但递增 `costs.missing_fee_count`；费后胜率、Profit Factor 和 Expectancy 因此可能不完整。
+
+## 交易活动与成本统计
+
+`trading` 和 `costs` 只依赖去重后的账本事件，不依赖订单请求或 Audit 记录。它们统计的是实际成交，
+不是策略发出的下单请求数量。
+
+- `trading.fill_count`、`buy_fill_count` 和 `sell_fill_count` 分别表示成交总数及买卖方向成交数。
+- `opened_position_count` 和 `closed_position_count` 按标的净仓位生命周期计算：首次建立仓位记为开仓，
+  仓位归零、反手或清算记为平仓；反手同时记为一次平仓和一次开仓；加仓、减仓不另计。
+- `total_volume` 为成交数量绝对值之和，`total_notional` 为 `abs(size) * price` 之和。
+- `first_fill_at`、`last_fill_at` 和 `active_duration_seconds` 依据首末成交时间计算。`fills_per_day` 以
+  首末成交覆盖的自然日数计算，单日运行按一天计。少于两笔成交时，平均成交间隔为 `None`。
+- `costs.trading_fees` 为已知成交及清算手续费；`known_fee_count` 和 `missing_fee_count` 表示费用数据完整性。
+- `funding_income` 和 `funding_expense` 均以非负金额表示资金费收入与支出；
+  `total_cost = trading_fees + funding_expense - funding_income`。
+- `effective_fee_rate = trading_fees / total_notional`，`cost_rate = total_cost / total_notional`；没有成交额时费率为 `None`。
 
 实盘若使用 `AsyncLedgerSink`，队列满、后台退出或写入失败可能导致账本缺失。该 sink 的
 `AsyncSinkStatus` 目前未写入 `PerformanceDataQuality`；生成实盘报告时，运行层应一并检查 sink
@@ -123,7 +141,7 @@ Sharpe、Sortino 或年化指标。
 ### Markdown
 
 `PerformanceReport::to_markdown()` 生成供终端、文档和评审阅读的 Markdown 表格，分为 Returns、
-Trades、PnL、Risk 和 Data Quality 五个区块。
+Trades、Activity、PnL、Costs、Risk 和 Data Quality 七个区块。
 
 - 金额保留两位小数并使用千分位。
 - PnL、收益和期望值等收益性指标的正数带 `+`。

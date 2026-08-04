@@ -1,4 +1,4 @@
 mod render;
 mod report;
 
-pub use report::{PerformanceDataQuality, PerformanceReport};
+pub use report::{CostStatistics, PerformanceDataQuality, PerformanceReport, TradingStatistics};
