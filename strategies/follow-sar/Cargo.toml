@@ -1,0 +1,13 @@
+[package]
+name = "follow-sar-strategy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+qf = { path = "../../crates/qf" }
+rust_decimal.workspace = true
+tokio.workspace = true
+yata.workspace = true

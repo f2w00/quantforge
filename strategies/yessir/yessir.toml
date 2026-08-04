@@ -1,0 +1,15 @@
+# 运行：cargo run -p yessir -- strategies/yessir/yessir.toml
+# 1bps=0.01%
+network = "mainnet"
+taker_fee_bps = 5
+market_slippage_bps = 5
+
+[[leaders]]
+name = "leader-a"
+address = "0x1003d8c532e5178673668e5f3aa48dc399ee940c"
+initial_equity = "10000"
+
+[[leaders]]
+name = "leader-b"
+address = "0xf97ad6704baec104d00b88e0c157e2b7b3a1ddd1"
+initial_equity = "10000"
