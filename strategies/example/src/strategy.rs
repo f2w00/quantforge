@@ -69,6 +69,7 @@ impl ExampleStrategy {
                 coin: self.coin.clone(),
                 side: Side::Buy,
                 size: HlOrderSize::Exact(self.entry_size),
+                leverage: Some(1),
                 reduce_only: false,
                 order_type: HlOrderType::Market {
                     max_slippage_bps: Some(self.max_slippage_bps),

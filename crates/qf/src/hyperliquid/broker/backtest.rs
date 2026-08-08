@@ -774,6 +774,7 @@ impl HyperliquidBroker for HyperliquidBacktestBroker {
                 Side::Buy
             },
             size: HlOrderSize::Exact(size),
+            leverage: None,
             reduce_only: true,
             order_type: HlOrderType::Market {
                 max_slippage_bps: request.max_slippage_bps,
@@ -854,6 +855,7 @@ mod tests {
             coin: coin.clone(),
             side,
             size: HlOrderSize::Exact(decimal(size)),
+            leverage: Some(1),
             reduce_only: false,
             order_type: HlOrderType::Market {
                 max_slippage_bps: Some(100),
@@ -1012,6 +1014,7 @@ mod tests {
                     margin_fraction: decimal("0.5"),
                     reserve_fraction: decimal("0.2"),
                 },
+                leverage: Some(5),
                 reduce_only: false,
                 order_type: HlOrderType::Market {
                     max_slippage_bps: None,

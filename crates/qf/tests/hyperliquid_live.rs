@@ -10,8 +10,7 @@ use qf::hyperliquid::types::{
     HlCloseRequest, HlCloseSize, HlCoin, HlOrderRequest, HlOrderSize, HlOrderType,
 };
 use qf::hyperliquid::{
-    HlLiveBrokerConfig, HlMarginMode, HlMarketConfig, HlNetwork, HyperliquidBroker,
-    HyperliquidLiveBroker,
+    HlLiveBrokerConfig, HlMarketConfig, HlNetwork, HyperliquidBroker, HyperliquidLiveBroker,
 };
 use qf::risk::{RiskGuard, RiskLimits};
 use qf::storage::{MemoryAuditSink, MemoryLedgerSink};
@@ -49,7 +48,7 @@ async fn mainnet_places_and_closes_doge_market_order_inner(audit: MemoryAuditSin
     config.markets = vec![HlMarketConfig {
         coin: coin.clone(),
         leverage: 5,
-        margin_mode: HlMarginMode::Auto,
+        margin_mode: None,
     }];
     let ledger = MemoryLedgerSink::new();
     let ledger_reader = ledger.clone();
@@ -96,6 +95,7 @@ async fn mainnet_places_and_closes_doge_market_order_inner(audit: MemoryAuditSin
             coin: coin.clone(),
             side: Side::Buy,
             size: HlOrderSize::Exact(order_size),
+            leverage: Some(1),
             reduce_only: false,
             order_type: HlOrderType::Market {
                 max_slippage_bps: Some(100),

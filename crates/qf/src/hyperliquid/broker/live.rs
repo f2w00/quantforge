@@ -84,6 +84,7 @@ pub struct HlLiveBrokerConfig {
     pub connect_timeout: std::time::Duration,
     pub freshness_max_age: std::time::Duration,
     pub reconciliation_interval: std::time::Duration,
+    pub default_margin_mode: HlMarginMode,
     pub markets: Vec<HlMarketConfig>,
     pub default_market_slippage_bps: u32,
     pub default_close_slippage_bps: u32,
@@ -99,6 +100,7 @@ impl HlLiveBrokerConfig {
             connect_timeout: std::time::Duration::from_secs(10),
             freshness_max_age: std::time::Duration::from_secs(30),
             reconciliation_interval: std::time::Duration::from_secs(10),
+            default_margin_mode: HlMarginMode::Auto,
             markets: Vec::new(),
             default_market_slippage_bps: 100,
             default_close_slippage_bps: 100,
@@ -110,7 +112,7 @@ impl HlLiveBrokerConfig {
 pub struct HlMarketConfig {
     pub coin: HlCoin,
     pub leverage: u32,
-    pub margin_mode: HlMarginMode,
+    pub margin_mode: Option<HlMarginMode>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -158,7 +160,9 @@ pub struct HyperliquidLiveBroker {
     pending_cancels: Mutex<HashSet<String>>,
     orders: Mutex<HashMap<HlClientOrderId, HlTrackedOrder>>,
     order_notifiers: Mutex<HashMap<HlClientOrderId, watch::Sender<HlTrackedOrder>>>,
-    markets: HashMap<HlCoin, HlMarketConfig>,
+    markets: Mutex<HashMap<HlCoin, HlMarketConfig>>,
+    market_locks: Mutex<HashMap<HlCoin, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    default_margin_mode: HlMarginMode,
     default_market_slippage_bps: u32,
     default_close_slippage_bps: u32,
 }
@@ -309,7 +313,7 @@ impl HyperliquidLiveBroker {
         let markets = config
             .markets
             .iter()
-            .map(|market| resolve_market_config(market, &metadata))
+            .map(|market| resolve_market_config(market, &metadata, config.default_margin_mode))
             .collect::<Result<Vec<_>, _>>()?;
         let broker = std::sync::Arc::new(Self::from_parts(
             config.strategy_id,
@@ -333,6 +337,7 @@ impl HyperliquidLiveBroker {
                 .cloned()
                 .map(|market| (market.coin.clone(), market))
                 .collect(),
+            config.default_margin_mode,
             config.default_market_slippage_bps,
             config.default_close_slippage_bps,
         ));
@@ -408,6 +413,7 @@ impl HyperliquidLiveBroker {
         collateral: HlCollateralState,
         freshness_max_age: std::time::Duration,
         markets: HashMap<HlCoin, HlMarketConfig>,
+        default_margin_mode: HlMarginMode,
         default_market_slippage_bps: u32,
         default_close_slippage_bps: u32,
     ) -> Self {
@@ -441,7 +447,9 @@ impl HyperliquidLiveBroker {
             pending_cancels: Mutex::new(HashSet::new()),
             orders: Mutex::new(HashMap::new()),
             order_notifiers: Mutex::new(HashMap::new()),
-            markets,
+            markets: Mutex::new(markets),
+            market_locks: Mutex::new(HashMap::new()),
+            default_margin_mode,
             default_market_slippage_bps,
             default_close_slippage_bps,
         }
@@ -1287,14 +1295,36 @@ impl HyperliquidLiveBroker {
     }
 
     pub async fn set_leverage(&self, market: &HlMarketConfig) -> Result<(), HlBrokerError> {
-        let result = self.set_leverage_inner(market).await;
-        let margin_mode = market.margin_mode.name();
+        let resolved_market = self
+            .metadata
+            .read()
+            .map_err(|_| HlBrokerError::StateUnavailable)
+            .and_then(|metadata| {
+                resolve_market_config(market, &metadata, self.default_margin_mode)
+            });
+        let result = match resolved_market {
+            Ok(market) => self.set_leverage_inner(&market).await.map(|()| market),
+            Err(error) => Err(error),
+        };
+        if let Ok(resolved_market) = &result {
+            if let Ok(mut markets) = self.markets.lock() {
+                markets.insert(market.coin.clone(), resolved_market.clone());
+            }
+        }
+        let audit_market = result.as_ref().ok().unwrap_or(market);
+        let margin_mode = audit_market
+            .margin_mode
+            .unwrap_or(self.default_margin_mode)
+            .name();
         let data = match &result {
-            Ok(()) => serde_json::json!({
+            Ok(_) => serde_json::json!({
                 "outcome": "accepted",
-                "leverage": market.leverage,
+                "leverage": audit_market.leverage,
                 "margin_mode": margin_mode,
-                "is_cross": market.margin_mode.is_cross(),
+                "is_cross": audit_market
+                    .margin_mode
+                    .unwrap_or(self.default_margin_mode)
+                    .is_cross(),
             }),
             Err(error) => serde_json::json!({
                 "leverage": market.leverage,
@@ -1303,7 +1333,7 @@ impl HyperliquidLiveBroker {
             }),
         };
         self.record_audit(AuditAction::SetLeverage, Some(market.coin.0.clone()), data);
-        result
+        result.map(|_| ())
     }
 
     async fn set_leverage_inner(&self, market: &HlMarketConfig) -> Result<(), HlBrokerError> {
@@ -1321,8 +1351,11 @@ impl HyperliquidLiveBroker {
             .ok_or_else(|| HlBrokerError::InvalidRequest {
                 message: format!("unknown Hyperliquid coin {}", market.coin.0),
             })?;
-        let margin_mode =
-            resolve_margin_mode(market.margin_mode, asset.only_isolated, &market.coin)?;
+        let margin_mode = resolve_margin_mode(
+            market.margin_mode.unwrap_or(self.default_margin_mode),
+            asset.only_isolated,
+            &market.coin,
+        )?;
         if let Some(max_leverage) = asset.max_leverage {
             if market.leverage > max_leverage {
                 return Err(HlBrokerError::InvalidRequest {
@@ -1358,6 +1391,46 @@ impl HyperliquidLiveBroker {
             .map_err(transport_error)?;
         parse_default_action_response(&raw)
             .map_err(|message| HlBrokerError::ExchangeRejected { message, raw })
+    }
+
+    fn market_lock(
+        &self,
+        coin: &HlCoin,
+    ) -> Result<std::sync::Arc<tokio::sync::Mutex<()>>, HlBrokerError> {
+        let mut locks = self
+            .market_locks
+            .lock()
+            .map_err(|_| HlBrokerError::StateUnavailable)?;
+        Ok(locks
+            .entry(coin.clone())
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+            .clone())
+    }
+
+    async fn ensure_leverage(&self, coin: &HlCoin, leverage: u32) -> Result<(), HlBrokerError> {
+        let configured = self
+            .markets
+            .lock()
+            .map_err(|_| HlBrokerError::StateUnavailable)?
+            .get(coin)
+            .cloned();
+        if configured
+            .as_ref()
+            .is_some_and(|market| market.leverage == leverage)
+        {
+            return Ok(());
+        }
+        let market = HlMarketConfig {
+            coin: coin.clone(),
+            leverage,
+            margin_mode: Some(
+                configured
+                    .and_then(|market| market.margin_mode)
+                    .unwrap_or(self.default_margin_mode),
+            ),
+        };
+        self.set_leverage(&market).await?;
+        Ok(())
     }
 
     fn release_pending_notional(&self, client_order_id: &HlClientOrderId) {
@@ -1861,6 +1934,19 @@ impl HyperliquidLiveBroker {
             .validate()
             .map_err(|message| HlBrokerError::InvalidRequest { message })?;
         self.wait_until_trading_ready().await?;
+        let _market_guard = if request.reduce_only {
+            None
+        } else {
+            Some(self.market_lock(&request.coin)?.lock_owned().await)
+        };
+        if !request.reduce_only {
+            let leverage = request
+                .leverage
+                .ok_or_else(|| HlBrokerError::InvalidRequest {
+                    message: "opening orders require leverage".to_string(),
+                })?;
+            self.ensure_leverage(&request.coin, leverage).await?;
+        }
         if request
             .expires_after
             .is_some_and(|expires_after| expires_after <= Utc::now())
@@ -1921,14 +2007,19 @@ impl HyperliquidLiveBroker {
                 margin_fraction,
                 reserve_fraction,
             } => {
-                let market = self.markets.get(&request.coin).ok_or_else(|| {
-                    HlBrokerError::InvalidRequest {
-                        message: format!(
-                            "margin-fraction sizing requires configured leverage for {}",
-                            request.coin.0
-                        ),
-                    }
-                })?;
+                let markets = self
+                    .markets
+                    .lock()
+                    .map_err(|_| HlBrokerError::StateUnavailable)?;
+                let market =
+                    markets
+                        .get(&request.coin)
+                        .ok_or_else(|| HlBrokerError::InvalidRequest {
+                            message: format!(
+                                "margin-fraction sizing requires configured leverage for {}",
+                                request.coin.0
+                            ),
+                        })?;
                 let account = self.account_state()?;
                 let available_collateral = self
                     .collateral
@@ -2237,6 +2328,7 @@ impl HyperliquidLiveBroker {
                 crate::core::Side::Buy
             },
             size: HlOrderSize::Exact(size),
+            leverage: None,
             reduce_only: true,
             order_type: HlOrderType::Market {
                 max_slippage_bps: request
@@ -2402,6 +2494,7 @@ fn trading_data_is_fresh(mids_fresh: bool, account_fresh: bool, open_orders_fres
 fn resolve_market_config(
     market: &HlMarketConfig,
     metadata: &HlMetadataSnapshot,
+    default_margin_mode: HlMarginMode,
 ) -> Result<HlMarketConfig, HlBrokerError> {
     let asset = metadata
         .asset(&market.coin)
@@ -2411,7 +2504,11 @@ fn resolve_market_config(
     Ok(HlMarketConfig {
         coin: market.coin.clone(),
         leverage: market.leverage,
-        margin_mode: resolve_margin_mode(market.margin_mode, asset.only_isolated, &market.coin)?,
+        margin_mode: Some(resolve_margin_mode(
+            market.margin_mode.unwrap_or(default_margin_mode),
+            asset.only_isolated,
+            &market.coin,
+        )?),
     })
 }
 
@@ -2498,6 +2595,7 @@ mod tests {
             std::time::Duration::from_secs(10)
         );
         assert!(config.markets.is_empty());
+        assert_eq!(config.default_margin_mode, HlMarginMode::Auto);
         assert_eq!(config.default_market_slippage_bps, 100);
         assert_eq!(config.default_close_slippage_bps, 100);
     }
@@ -2548,6 +2646,7 @@ mod tests {
             coin: HlCoin::new("DOGE"),
             side: Side::Buy,
             size: HlOrderSize::Exact("12.3456".parse().unwrap()),
+            leverage: Some(5),
             reduce_only: false,
             order_type: HlOrderType::Limit {
                 limit_price: "0.123456".parse().unwrap(),

@@ -133,6 +133,7 @@ pub struct HlOrderRequest {
     pub coin: HlCoin,
     pub side: Side,
     pub size: HlOrderSize,
+    pub leverage: Option<u32>,
     pub reduce_only: bool,
     pub order_type: HlOrderType,
     pub client_order_id: Option<HlClientOrderId>,
@@ -150,6 +151,9 @@ pub enum HlOrderSize {
 
 impl HlOrderRequest {
     pub fn validate(&self) -> Result<(), String> {
+        if self.leverage == Some(0) {
+            return Err("leverage must be positive".to_string());
+        }
         match &self.order_type {
             HlOrderType::Market { max_slippage_bps } => {
                 if let Some(max_slippage_bps) = max_slippage_bps {
@@ -502,6 +506,27 @@ impl HlExchangeAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_zero_order_leverage() {
+        let request = HlOrderRequest {
+            coin: HlCoin::new("BTC"),
+            side: Side::Buy,
+            size: HlOrderSize::Exact(Decimal::ONE),
+            leverage: Some(0),
+            reduce_only: false,
+            order_type: HlOrderType::Market {
+                max_slippage_bps: Some(100),
+            },
+            client_order_id: None,
+            expires_after: None,
+        };
+
+        assert_eq!(
+            request.validate(),
+            Err("leverage must be positive".to_string())
+        );
+    }
 
     #[test]
     fn serializes_update_leverage_action() {

@@ -111,6 +111,7 @@ mod tests {
             coin: HlCoin::new("BTC"),
             side: Side::Buy,
             size: crate::hyperliquid::types::HlOrderSize::Exact(decimal("1")),
+            leverage: Some(1),
             reduce_only: false,
             order_type: HlOrderType::Market {
                 max_slippage_bps: Some(100),

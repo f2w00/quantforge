@@ -357,6 +357,7 @@ async fn apply_snapshot(
                     Side::Sell
                 },
                 size: HlOrderSize::Exact(size),
+                leverage: Some(leverage),
                 reduce_only: false,
                 order_type: HlOrderType::Market {
                     max_slippage_bps: None,

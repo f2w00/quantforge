@@ -134,6 +134,7 @@ impl FollowSarStrategy {
                 coin: self.coin.clone(),
                 side,
                 size: HlOrderSize::Exact(ENTRY_POSITION_SIZE),
+                leverage: Some(1),
                 reduce_only: false,
                 order_type: HlOrderType::Market {
                     max_slippage_bps: Some(self.max_slippage_bps),
