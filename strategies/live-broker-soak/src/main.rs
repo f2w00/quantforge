@@ -233,6 +233,10 @@ async fn run_round(
         })
         .await
         .context("failed to cancel post-only probe order")?;
+    broker
+        .wait_order_terminal(&resting.submitted.client_order_id, ORDER_TIMEOUT)
+        .await
+        .context("canceled post-only probe order did not reach a terminal state")?;
     let cancel_submit_ms = elapsed_ms(cancel_started);
     let cancel_idle_started = Instant::now();
     wait_until_idle(broker, coin).await?;
