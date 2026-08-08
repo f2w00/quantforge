@@ -14,7 +14,9 @@ use crate::hyperliquid::broker::HlBrokerError;
 use crate::hyperliquid::broker::risk_adapter::order_risk_input_at_price;
 use crate::hyperliquid::broker::state::HlBrokerState;
 use crate::hyperliquid::broker::traits::HyperliquidBroker;
-use crate::hyperliquid::client::rest::order_status_from_response;
+use crate::hyperliquid::client::rest::{
+    HlSpotUsdcState, HlUserAbstraction, order_status_from_response,
+};
 use crate::hyperliquid::client::ws::{
     HyperliquidWsEvent, funding_events, non_funding_ledger_events, order_updates,
     parse_cancel_response, parse_default_action_response, parse_order_outcome, user_fills,
@@ -108,7 +110,28 @@ impl HlLiveBrokerConfig {
 pub struct HlMarketConfig {
     pub coin: HlCoin,
     pub leverage: u32,
-    pub is_cross: bool,
+    pub margin_mode: HlMarginMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HlMarginMode {
+    Auto,
+    Cross,
+    Isolated,
+}
+
+impl HlMarginMode {
+    fn is_cross(self) -> bool {
+        matches!(self, Self::Cross)
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Cross => "cross",
+            Self::Isolated => "isolated",
+        }
+    }
 }
 
 pub struct HyperliquidLiveBroker {
@@ -126,6 +149,7 @@ pub struct HyperliquidLiveBroker {
     order_updates: RwLock<Vec<HlOrderUpdate>>,
     fills: RwLock<Vec<HlUserFill>>,
     account_address: String,
+    collateral: RwLock<HlCollateralState>,
     freshness_max_age: std::time::Duration,
     freshness: RwLock<HlFreshness>,
     ws_ready: watch::Sender<bool>,
@@ -137,6 +161,32 @@ pub struct HyperliquidLiveBroker {
     markets: HashMap<HlCoin, HlMarketConfig>,
     default_market_slippage_bps: u32,
     default_close_slippage_bps: u32,
+}
+
+#[derive(Clone, Debug)]
+struct HlCollateralState {
+    abstraction: HlUserAbstraction,
+    spot_usdc: Option<HlSpotUsdcState>,
+}
+
+impl HlCollateralState {
+    fn total_collateral(&self, perp_account: &HlAccountState) -> Decimal {
+        self.spot_usdc
+            .as_ref()
+            .map(|spot| spot.total)
+            .unwrap_or(perp_account.equity)
+    }
+
+    fn apply_to(&self, account: &mut HlAccountState) {
+        account.equity = self.total_collateral(account);
+    }
+
+    fn available_collateral(&self, perp_account: &HlAccountState) -> Decimal {
+        self.spot_usdc
+            .as_ref()
+            .map(|spot| spot.available_after_maintenance)
+            .unwrap_or_else(|| (perp_account.equity - perp_account.margin_used).max(Decimal::ZERO))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -212,9 +262,42 @@ impl HyperliquidLiveBroker {
         let mids = client.all_mids().await.map_err(|error| {
             Self::connection_error(&journal, &config.strategy_id, "mids", error)
         })?;
-        let account = client.clearinghouse_state(&user).await.map_err(|error| {
+        let abstraction = client.user_abstraction(&user).await.map_err(|error| {
+            Self::connection_error(&journal, &config.strategy_id, "user_abstraction", error)
+        })?;
+        if abstraction == HlUserAbstraction::DexAbstraction {
+            let error = HlBrokerError::InvalidRequest {
+                message: "Hyperliquid dexAbstraction account funding is unsupported".to_string(),
+            };
+            Self::record_connection_error(
+                &journal,
+                &config.strategy_id,
+                "user_abstraction",
+                &error,
+            );
+            return Err(error);
+        }
+        let mut account = client.clearinghouse_state(&user).await.map_err(|error| {
             Self::connection_error(&journal, &config.strategy_id, "account", error)
         })?;
+        let perp_account_value = account.equity;
+        let spot_usdc = if abstraction.uses_spot_collateral() {
+            Some(
+                client
+                    .spot_clearinghouse_state(&user)
+                    .await
+                    .map_err(|error| {
+                        Self::connection_error(&journal, &config.strategy_id, "spot_account", error)
+                    })?,
+            )
+        } else {
+            None
+        };
+        let collateral = HlCollateralState {
+            abstraction,
+            spot_usdc,
+        };
+        collateral.apply_to(&mut account);
         let open_orders = client.open_orders(&user).await.map_err(|error| {
             Self::connection_error(&journal, &config.strategy_id, "open_orders", error)
         })?;
@@ -223,6 +306,11 @@ impl HyperliquidLiveBroker {
             .map_err(|error| {
                 Self::connection_error(&journal, &config.strategy_id, "websocket", error)
             })?;
+        let markets = config
+            .markets
+            .iter()
+            .map(|market| resolve_market_config(market, &metadata))
+            .collect::<Result<Vec<_>, _>>()?;
         let broker = std::sync::Arc::new(Self::from_parts(
             config.strategy_id,
             journal,
@@ -238,9 +326,9 @@ impl HyperliquidLiveBroker {
             ws,
             config.network,
             user.clone(),
+            collateral,
             config.freshness_max_age,
-            config
-                .markets
+            markets
                 .iter()
                 .cloned()
                 .map(|market| (market.coin.clone(), market))
@@ -248,6 +336,11 @@ impl HyperliquidLiveBroker {
             config.default_market_slippage_bps,
             config.default_close_slippage_bps,
         ));
+        broker.record_audit(
+            AuditAction::Connect,
+            None,
+            broker.collateral_audit_data(perp_account_value),
+        );
         broker.record_equity_snapshot();
 
         broker.ws.subscribe_all_mids().await.map_err(|error| {
@@ -281,7 +374,7 @@ impl HyperliquidLiveBroker {
                 );
                 error
         })?;
-        for market in &config.markets {
+        for market in &markets {
             broker.set_leverage(market).await.map_err(|error| {
                 broker.record_audit(
                     AuditAction::Connect,
@@ -312,6 +405,7 @@ impl HyperliquidLiveBroker {
         ws: HyperliquidWsClient,
         network: HlNetwork,
         account_address: String,
+        collateral: HlCollateralState,
         freshness_max_age: std::time::Duration,
         markets: HashMap<HlCoin, HlMarketConfig>,
         default_market_slippage_bps: u32,
@@ -334,6 +428,7 @@ impl HyperliquidLiveBroker {
             order_updates: RwLock::new(Vec::new()),
             fills: RwLock::new(Vec::new()),
             account_address,
+            collateral: RwLock::new(collateral),
             freshness_max_age,
             freshness: RwLock::new(HlFreshness {
                 mids: mids_updated_at,
@@ -750,7 +845,8 @@ impl HyperliquidLiveBroker {
         match message.get("channel").and_then(Value::as_str) {
             Some("allMids") => self.apply_mids_event(&message),
             Some("clearinghouseState") => {
-                let account = ws_clearinghouse_state(&message).map_err(transport_error)?;
+                let mut account = ws_clearinghouse_state(&message).map_err(transport_error)?;
+                self.apply_collateral(&mut account)?;
                 self.state
                     .write()
                     .map_err(|_| HlBrokerError::StateUnavailable)?
@@ -972,11 +1068,16 @@ impl HyperliquidLiveBroker {
             let mut ticker = tokio::time::interval(reconciliation_interval);
             loop {
                 ticker.tick().await;
-                match self.client.clearinghouse_state(&self.account_address).await {
-                    Ok(account) => {
+                match self.refresh_account().await {
+                    Ok((account, perp_account_value)) => {
                         if let Ok(mut state) = self.state.write() {
                             state.account = account;
                         }
+                        self.record_audit(
+                            AuditAction::ReconcileState,
+                            None,
+                            self.collateral_audit_data(perp_account_value),
+                        );
                         self.record_equity_snapshot();
                         let _ = self.mark_fresh(|freshness| freshness.account = Some(Utc::now()));
                     }
@@ -1034,6 +1135,76 @@ impl HyperliquidLiveBroker {
                     }
                 }
             }
+        })
+    }
+
+    async fn refresh_account(&self) -> Result<(HlAccountState, Decimal), HlBrokerError> {
+        let mut account = self
+            .client
+            .clearinghouse_state(&self.account_address)
+            .await
+            .map_err(transport_error)?;
+        let perp_account_value = account.equity;
+        let uses_spot_collateral = self
+            .collateral
+            .read()
+            .map_err(|_| HlBrokerError::StateUnavailable)?
+            .abstraction
+            .uses_spot_collateral();
+        if uses_spot_collateral {
+            let spot_usdc = self
+                .client
+                .spot_clearinghouse_state(&self.account_address)
+                .await
+                .map_err(transport_error)?;
+            self.collateral
+                .write()
+                .map_err(|_| HlBrokerError::StateUnavailable)?
+                .spot_usdc = Some(spot_usdc);
+        }
+        self.apply_collateral(&mut account)?;
+        Ok((account, perp_account_value))
+    }
+
+    fn apply_collateral(&self, account: &mut HlAccountState) -> Result<(), HlBrokerError> {
+        self.collateral
+            .read()
+            .map_err(|_| HlBrokerError::StateUnavailable)?
+            .apply_to(account);
+        Ok(())
+    }
+
+    fn collateral_audit_data(&self, perp_account_value: Decimal) -> Value {
+        let collateral = match self.collateral.read() {
+            Ok(collateral) => collateral,
+            Err(_) => return serde_json::json!({"collateral": "state_unavailable"}),
+        };
+        let spot_usdc = collateral.spot_usdc.as_ref();
+        let margin_used = self
+            .state
+            .read()
+            .map(|state| state.account.margin_used)
+            .unwrap_or(Decimal::ZERO);
+        let total_collateral = spot_usdc
+            .map(|spot| spot.total)
+            .unwrap_or(perp_account_value);
+        let available_collateral = spot_usdc
+            .map(|spot| spot.available_after_maintenance)
+            .unwrap_or_else(|| (perp_account_value - margin_used).max(Decimal::ZERO));
+        serde_json::json!({
+            "account_abstraction": collateral.abstraction.name(),
+            "equity_source": if collateral.abstraction.uses_spot_collateral() {
+                "spot_usdc_total"
+            } else {
+                "perp_account_value"
+            },
+            "spot_usdc_total": spot_usdc.map(|spot| spot.total.to_string()),
+            "spot_usdc_hold": spot_usdc.map(|spot| spot.hold.to_string()),
+            "spot_usdc_available_after_maintenance": spot_usdc
+                .map(|spot| spot.available_after_maintenance.to_string()),
+            "perp_account_value": perp_account_value.to_string(),
+            "total_collateral": total_collateral.to_string(),
+            "available_collateral": available_collateral.to_string(),
         })
     }
 
@@ -1117,15 +1288,17 @@ impl HyperliquidLiveBroker {
 
     pub async fn set_leverage(&self, market: &HlMarketConfig) -> Result<(), HlBrokerError> {
         let result = self.set_leverage_inner(market).await;
+        let margin_mode = market.margin_mode.name();
         let data = match &result {
             Ok(()) => serde_json::json!({
                 "outcome": "accepted",
                 "leverage": market.leverage,
-                "is_cross": market.is_cross,
+                "margin_mode": margin_mode,
+                "is_cross": market.margin_mode.is_cross(),
             }),
             Err(error) => serde_json::json!({
                 "leverage": market.leverage,
-                "is_cross": market.is_cross,
+                "margin_mode": margin_mode,
                 "error": Self::audit_error(error),
             }),
         };
@@ -1139,11 +1312,6 @@ impl HyperliquidLiveBroker {
                 message: "leverage must be positive".to_string(),
             });
         }
-        if !market.is_cross {
-            return Err(HlBrokerError::InvalidRequest {
-                message: "isolated leverage is not supported yet".to_string(),
-            });
-        }
         let asset = self
             .metadata
             .read()
@@ -1153,6 +1321,8 @@ impl HyperliquidLiveBroker {
             .ok_or_else(|| HlBrokerError::InvalidRequest {
                 message: format!("unknown Hyperliquid coin {}", market.coin.0),
             })?;
+        let margin_mode =
+            resolve_margin_mode(market.margin_mode, asset.only_isolated, &market.coin)?;
         if let Some(max_leverage) = asset.max_leverage {
             if market.leverage > max_leverage {
                 return Err(HlBrokerError::InvalidRequest {
@@ -1165,7 +1335,7 @@ impl HyperliquidLiveBroker {
         }
         let action = HlExchangeAction::UpdateLeverage(HlUpdateLeverageAction {
             asset: asset.asset_id,
-            is_cross: market.is_cross,
+            is_cross: margin_mode.is_cross(),
             leverage: market.leverage,
         });
         let signed = self
@@ -1506,8 +1676,23 @@ fn normalize_order_precision(
     Ok((normalized_size, normalized_price))
 }
 
+fn ensure_minimum_order_notional(
+    size: crate::core::Decimal,
+    price: crate::core::Decimal,
+) -> Result<(), HlBrokerError> {
+    let minimum = crate::core::Decimal::from(10);
+    let notional = size * price;
+    if notional < minimum {
+        return Err(HlBrokerError::InvalidRequest {
+            message: format!("order notional {notional} is below Hyperliquid minimum {minimum}"),
+        });
+    }
+    Ok(())
+}
+
 fn resolve_margin_fraction_size(
-    account: &HlAccountState,
+    total_collateral: Decimal,
+    available_collateral: Decimal,
     reference_price: Decimal,
     size_decimals: u32,
     leverage: u32,
@@ -1534,9 +1719,8 @@ fn resolve_margin_fraction_size(
             message: "reference price must be positive".to_string(),
         });
     }
-    let reserve_margin = account.equity * reserve_fraction;
-    let available_margin =
-        (account.equity - account.margin_used - reserve_margin).max(Decimal::ZERO);
+    let reserve_margin = total_collateral * reserve_fraction;
+    let available_margin = (available_collateral - reserve_margin).max(Decimal::ZERO);
     let margin = available_margin * margin_fraction;
     let notional = margin * Decimal::from(leverage);
     let size = (notional / reference_price)
@@ -1655,7 +1839,14 @@ fn order_update_state(status: &str) -> Option<HlTrackedOrderState> {
         "canceled" | "margincanceled" | "selftradecanceled" | "delistedcanceled" => {
             Some(HlTrackedOrderState::Canceled)
         }
-        "rejected" => Some(HlTrackedOrderState::Rejected),
+        "rejected"
+        | "mintradentlrejected"
+        | "perpmarginrejected"
+        | "reduceonlyrejected"
+        | "badalopxrejected"
+        | "ioccancelrejected"
+        | "marketordernoliquidityrejected"
+        | "oraclerejected" => Some(HlTrackedOrderState::Rejected),
         "expired" => Some(HlTrackedOrderState::Expired),
         _ => None,
     }
@@ -1718,6 +1909,7 @@ impl HyperliquidLiveBroker {
         let (asset, size_decimals) = asset.ok_or_else(|| HlBrokerError::InvalidRequest {
             message: format!("unknown Hyperliquid coin {}", request.coin.0),
         })?;
+        let mut sizing_audit = None;
         let size = match request.size {
             HlOrderSize::Exact(size) if size > Decimal::ZERO => size,
             HlOrderSize::Exact(_) => {
@@ -1737,8 +1929,31 @@ impl HyperliquidLiveBroker {
                         ),
                     }
                 })?;
+                let account = self.account_state()?;
+                let available_collateral = self
+                    .collateral
+                    .read()
+                    .map_err(|_| HlBrokerError::StateUnavailable)?
+                    .available_collateral(&account);
+                let reserve_margin = account.equity * reserve_fraction;
+                let available_after_reserve =
+                    (available_collateral - reserve_margin).max(Decimal::ZERO);
+                let planned_margin = available_after_reserve * margin_fraction;
+                let planned_notional = planned_margin * Decimal::from(market.leverage);
+                sizing_audit = Some(serde_json::json!({
+                    "total_collateral": account.equity.to_string(),
+                    "available_collateral": available_collateral.to_string(),
+                    "reserve_base": account.equity.to_string(),
+                    "reserve_fraction": reserve_fraction.to_string(),
+                    "reserve_amount": reserve_margin.to_string(),
+                    "available_after_reserve": available_after_reserve.to_string(),
+                    "margin_fraction": margin_fraction.to_string(),
+                    "planned_margin": planned_margin.to_string(),
+                    "planned_notional": planned_notional.to_string(),
+                }));
                 resolve_margin_fraction_size(
-                    &self.account_state()?,
+                    account.equity,
+                    available_collateral,
                     price,
                     size_decimals,
                     market.leverage,
@@ -1749,6 +1964,9 @@ impl HyperliquidLiveBroker {
         };
         let (normalized_size, price) = normalize_order_precision(size, price, size_decimals)
             .map_err(|message| HlBrokerError::InvalidRequest { message })?;
+        if !request.reduce_only {
+            ensure_minimum_order_notional(normalized_size, price)?;
+        }
         let (account, state_open_orders) = {
             let state = self
                 .state
@@ -1803,6 +2021,9 @@ impl HyperliquidLiveBroker {
         let action = request.to_order_action(asset, price, normalized_size);
         self.register_order(submitted.clone())?;
         let mut audit_data = self.order_audit_context(&request, &client_order_id, Some(&submitted));
+        if let Some(sizing_audit) = sizing_audit {
+            audit_data["sizing"] = sizing_audit;
+        }
         audit_data["stage"] = serde_json::json!("submit_attempt");
         audit_data["wire_action"] = action.to_hyperliquid_json();
         self.record_audit(
@@ -2178,6 +2399,37 @@ fn trading_data_is_fresh(mids_fresh: bool, account_fresh: bool, open_orders_fres
     mids_fresh && account_fresh && open_orders_fresh
 }
 
+fn resolve_market_config(
+    market: &HlMarketConfig,
+    metadata: &HlMetadataSnapshot,
+) -> Result<HlMarketConfig, HlBrokerError> {
+    let asset = metadata
+        .asset(&market.coin)
+        .ok_or_else(|| HlBrokerError::InvalidRequest {
+            message: format!("unknown Hyperliquid coin {}", market.coin.0),
+        })?;
+    Ok(HlMarketConfig {
+        coin: market.coin.clone(),
+        leverage: market.leverage,
+        margin_mode: resolve_margin_mode(market.margin_mode, asset.only_isolated, &market.coin)?,
+    })
+}
+
+fn resolve_margin_mode(
+    requested: HlMarginMode,
+    only_isolated: bool,
+    coin: &HlCoin,
+) -> Result<HlMarginMode, HlBrokerError> {
+    match (requested, only_isolated) {
+        (HlMarginMode::Auto, true) => Ok(HlMarginMode::Isolated),
+        (HlMarginMode::Auto, false) => Ok(HlMarginMode::Cross),
+        (HlMarginMode::Cross, true) => Err(HlBrokerError::InvalidRequest {
+            message: format!("{} only supports isolated margin", coin.0),
+        }),
+        (mode, _) => Ok(mode),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2248,6 +2500,45 @@ mod tests {
         assert!(config.markets.is_empty());
         assert_eq!(config.default_market_slippage_bps, 100);
         assert_eq!(config.default_close_slippage_bps, 100);
+    }
+
+    #[test]
+    fn auto_selects_isolated_for_isolated_only_market() {
+        let coin = HlCoin::new("ETH");
+        assert_eq!(
+            resolve_margin_mode(HlMarginMode::Auto, true, &coin).unwrap(),
+            HlMarginMode::Isolated
+        );
+    }
+
+    #[test]
+    fn auto_selects_cross_for_market_supporting_cross_margin() {
+        let coin = HlCoin::new("BTC");
+        assert_eq!(
+            resolve_margin_mode(HlMarginMode::Auto, false, &coin).unwrap(),
+            HlMarginMode::Cross
+        );
+    }
+
+    #[test]
+    fn rejects_explicit_cross_for_isolated_only_market() {
+        let coin = HlCoin::new("ETH");
+        let error = resolve_margin_mode(HlMarginMode::Cross, true, &coin).unwrap_err();
+
+        assert!(matches!(
+            error,
+            HlBrokerError::InvalidRequest { message }
+                if message == "ETH only supports isolated margin"
+        ));
+    }
+
+    #[test]
+    fn keeps_explicit_isolated_mode() {
+        let coin = HlCoin::new("BTC");
+        assert_eq!(
+            resolve_margin_mode(HlMarginMode::Isolated, false, &coin).unwrap(),
+            HlMarginMode::Isolated
+        );
     }
 
     #[test]
@@ -2437,6 +2728,27 @@ mod tests {
     fn rejects_size_beyond_metadata_precision() {
         let result = normalize_order_precision("1.001".parse().unwrap(), "100".parse().unwrap(), 2);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_non_reduce_only_orders_below_minimum_notional() {
+        let error =
+            ensure_minimum_order_notional("0.41".parse().unwrap(), "22.935".parse().unwrap())
+                .unwrap_err();
+
+        assert!(matches!(
+            error,
+            HlBrokerError::InvalidRequest { message }
+                if message == "order notional 9.40335 is below Hyperliquid minimum 10"
+        ));
+    }
+
+    #[test]
+    fn recognizes_minimum_notional_rejection_as_terminal() {
+        assert_eq!(
+            order_update_state("minTradeNtlRejected"),
+            Some(HlTrackedOrderState::Rejected)
+        );
     }
 
     #[test]
@@ -2640,14 +2952,9 @@ mod tests {
 
     #[test]
     fn resolves_margin_fraction_size_down() {
-        let account = HlAccountState {
-            equity: "1000".parse().unwrap(),
-            margin_used: "100".parse().unwrap(),
-            positions: HashMap::new(),
-            updated_at: Utc::now(),
-        };
         let size = resolve_margin_fraction_size(
-            &account,
+            "1000".parse().unwrap(),
+            "900".parse().unwrap(),
             "12345".parse().unwrap(),
             3,
             5,
@@ -2657,6 +2964,65 @@ mod tests {
         .unwrap();
 
         assert_eq!(size, "0.162".parse().unwrap());
+    }
+
+    #[test]
+    fn unified_collateral_drives_margin_fraction_sizing() {
+        let size = resolve_margin_fraction_size(
+            Decimal::from(999),
+            Decimal::from(999),
+            Decimal::from(1),
+            2,
+            1,
+            "0.1".parse().unwrap(),
+            "0.9".parse().unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(size, "9.99".parse().unwrap());
+    }
+
+    #[test]
+    fn unified_reserve_uses_total_collateral() {
+        let error = resolve_margin_fraction_size(
+            "998.758219".parse().unwrap(),
+            "797.264".parse().unwrap(),
+            Decimal::from(1),
+            2,
+            1,
+            Decimal::ONE,
+            "0.9".parse().unwrap(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            HlBrokerError::InvalidRequest { message }
+                if message == "sizing result is below the minimum quantity increment"
+        ));
+    }
+
+    #[test]
+    fn unified_collateral_survives_perp_account_updates() {
+        let collateral = HlCollateralState {
+            abstraction: HlUserAbstraction::UnifiedAccount,
+            spot_usdc: Some(HlSpotUsdcState {
+                total: Decimal::from(999),
+                hold: Decimal::ZERO,
+                available_after_maintenance: Decimal::from(999),
+            }),
+        };
+        let mut perp_update = HlAccountState {
+            equity: Decimal::ZERO,
+            margin_used: Decimal::from(10),
+            positions: HashMap::new(),
+            updated_at: Utc::now(),
+        };
+
+        collateral.apply_to(&mut perp_update);
+
+        assert_eq!(perp_update.equity, Decimal::from(999));
+        assert_eq!(perp_update.margin_used, Decimal::from(10));
     }
 
     #[test]

@@ -5,7 +5,9 @@ use anyhow::Context;
 use qf::audit::{LedgerEvent, LedgerSink, RunJournal};
 use qf::core::{JournalId, StrategyId};
 use qf::hyperliquid::client::HyperliquidSigner;
-use qf::hyperliquid::{HlLiveBrokerConfig, HlMarketConfig, HlNetwork, HyperliquidLiveBroker};
+use qf::hyperliquid::{
+    HlLiveBrokerConfig, HlMarginMode, HlMarketConfig, HlNetwork, HyperliquidLiveBroker,
+};
 use qf::risk::{RiskGuard, RiskLimits};
 use qf::storage::{JsonlAuditSink, JsonlWriter};
 
@@ -22,7 +24,7 @@ pub async fn run(
     config.markets = vec![HlMarketConfig {
         coin: strategy.coin().clone(),
         leverage: 1,
-        is_cross: true,
+        margin_mode: HlMarginMode::Auto,
     }];
     let audit_path = std::env::var("QF_AUDIT_PATH")
         .unwrap_or_else(|_| "runs/example-live-audit.jsonl".to_string());

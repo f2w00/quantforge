@@ -7,5 +7,7 @@ pub mod traits;
 
 pub use backtest::HyperliquidBacktestBroker;
 pub use error::HlBrokerError;
-pub use live::{HlLiveBrokerConfig, HlMarketConfig, HlNetwork, HyperliquidLiveBroker};
+pub use live::{
+    HlLiveBrokerConfig, HlMarginMode, HlMarketConfig, HlNetwork, HyperliquidLiveBroker,
+};
 pub use traits::HyperliquidBroker;

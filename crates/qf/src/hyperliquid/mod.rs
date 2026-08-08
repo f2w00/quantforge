@@ -3,6 +3,6 @@ pub mod client;
 pub mod types;
 
 pub use broker::{
-    HlLiveBrokerConfig, HlMarketConfig, HlNetwork, HyperliquidBacktestBroker, HyperliquidBroker,
-    HyperliquidLiveBroker,
+    HlLiveBrokerConfig, HlMarginMode, HlMarketConfig, HlNetwork, HyperliquidBacktestBroker,
+    HyperliquidBroker, HyperliquidLiveBroker,
 };

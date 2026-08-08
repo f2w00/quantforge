@@ -57,6 +57,26 @@ impl HyperliquidRestClient {
         response.try_into()
     }
 
+    pub async fn user_abstraction(&self, user: &str) -> anyhow::Result<HlUserAbstraction> {
+        let abstraction: String = self
+            .info(serde_json::json!({
+                "type": "userAbstraction",
+                "user": user,
+            }))
+            .await?;
+        abstraction.parse()
+    }
+
+    pub async fn spot_clearinghouse_state(&self, user: &str) -> anyhow::Result<HlSpotUsdcState> {
+        let response: SpotClearinghouseStateWire = self
+            .info(serde_json::json!({
+                "type": "spotClearinghouseState",
+                "user": user,
+            }))
+            .await?;
+        response.usdc_state()
+    }
+
     pub async fn open_orders(&self, user: &str) -> anyhow::Result<Vec<HlOpenOrder>> {
         let response: Vec<OpenOrderWire> = self
             .info(serde_json::json!({
@@ -123,6 +143,53 @@ impl HyperliquidRestClient {
             .json()
             .await?)
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HlUserAbstraction {
+    Default,
+    Disabled,
+    UnifiedAccount,
+    PortfolioMargin,
+    DexAbstraction,
+}
+
+impl HlUserAbstraction {
+    pub fn uses_spot_collateral(self) -> bool {
+        matches!(self, Self::UnifiedAccount | Self::PortfolioMargin)
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Disabled => "disabled",
+            Self::UnifiedAccount => "unifiedAccount",
+            Self::PortfolioMargin => "portfolioMargin",
+            Self::DexAbstraction => "dexAbstraction",
+        }
+    }
+}
+
+impl std::str::FromStr for HlUserAbstraction {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "default" => Ok(Self::Default),
+            "disabled" => Ok(Self::Disabled),
+            "unifiedAccount" => Ok(Self::UnifiedAccount),
+            "portfolioMargin" => Ok(Self::PortfolioMargin),
+            "dexAbstraction" => Ok(Self::DexAbstraction),
+            _ => anyhow::bail!("unsupported Hyperliquid user abstraction {value}"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HlSpotUsdcState {
+    pub total: Decimal,
+    pub hold: Decimal,
+    pub available_after_maintenance: Decimal,
 }
 
 #[derive(Debug, Deserialize)]
@@ -226,6 +293,45 @@ impl TryFrom<ClearinghouseStateWire> for HlAccountState {
                 .timestamp_millis_opt(value.time)
                 .single()
                 .ok_or_else(|| anyhow::anyhow!("invalid clearinghouseState timestamp"))?,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SpotClearinghouseStateWire {
+    balances: Vec<SpotBalanceWire>,
+    token_to_available_after_maintenance: Vec<(u32, String)>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SpotBalanceWire {
+    coin: String,
+    token: u32,
+    total: String,
+    hold: String,
+}
+
+impl SpotClearinghouseStateWire {
+    fn usdc_state(self) -> anyhow::Result<HlSpotUsdcState> {
+        let balance = self
+            .balances
+            .iter()
+            .find(|balance| balance.token == 0 || balance.coin.eq_ignore_ascii_case("USDC"))
+            .ok_or_else(|| anyhow::anyhow!("spotClearinghouseState has no USDC balance"))?;
+        let available_after_maintenance = self
+            .token_to_available_after_maintenance
+            .iter()
+            .find_map(|(token, available)| (*token == balance.token).then_some(available))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "spotClearinghouseState has no available-after-maintenance value for USDC"
+                )
+            })?;
+        Ok(HlSpotUsdcState {
+            total: balance.total.parse()?,
+            hold: balance.hold.parse()?,
+            available_after_maintenance: available_after_maintenance.parse()?,
         })
     }
 }
@@ -339,6 +445,52 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("not an API wallet"));
+    }
+
+    #[test]
+    fn parses_known_user_abstractions() {
+        assert_eq!(
+            "unifiedAccount".parse::<HlUserAbstraction>().unwrap(),
+            HlUserAbstraction::UnifiedAccount
+        );
+        assert_eq!(
+            "portfolioMargin".parse::<HlUserAbstraction>().unwrap(),
+            HlUserAbstraction::PortfolioMargin
+        );
+        assert!("unknown".parse::<HlUserAbstraction>().is_err());
+    }
+
+    #[test]
+    fn extracts_usdc_by_token_and_available_collateral() {
+        let state: SpotClearinghouseStateWire = serde_json::from_value(serde_json::json!({
+            "balances": [
+                {"coin": "BTC", "token": 1, "total": "2", "hold": "1"},
+                {"coin": "USDC", "token": 0, "total": "999", "hold": "3"}
+            ],
+            "tokenToAvailableAfterMaintenance": [[0, "996"]]
+        }))
+        .unwrap();
+        let state = state.usdc_state().unwrap();
+        assert_eq!(state.total, "999".parse().unwrap());
+        assert_eq!(state.hold, "3".parse().unwrap());
+        assert_eq!(state.available_after_maintenance, "996".parse().unwrap());
+    }
+
+    #[test]
+    fn rejects_missing_usdc_and_invalid_available_collateral() {
+        let missing: SpotClearinghouseStateWire = serde_json::from_value(serde_json::json!({
+            "balances": [{"coin": "BTC", "token": 1, "total": "2", "hold": "1"}],
+            "tokenToAvailableAfterMaintenance": [[0, "2"]]
+        }))
+        .unwrap();
+        assert!(missing.usdc_state().is_err());
+
+        let invalid: SpotClearinghouseStateWire = serde_json::from_value(serde_json::json!({
+            "balances": [{"coin": "USDC", "token": 0, "total": "bad", "hold": "0"}],
+            "tokenToAvailableAfterMaintenance": [[0, "1"]]
+        }))
+        .unwrap();
+        assert!(invalid.usdc_state().is_err());
     }
 
     #[test]
