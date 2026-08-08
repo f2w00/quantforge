@@ -200,11 +200,7 @@ fn grouped_fixed(value: Decimal, decimal_places: usize) -> String {
 }
 
 fn yes_no(value: bool) -> &'static str {
-    if value {
-        "Yes"
-    } else {
-        "No"
-    }
+    if value { "Yes" } else { "No" }
 }
 
 fn na() -> String {
