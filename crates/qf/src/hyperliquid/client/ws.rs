@@ -88,9 +88,7 @@ pub(crate) fn non_funding_ledger_events(message: &Value) -> Vec<Value> {
 }
 
 pub(crate) fn parse_order_outcome(raw: &Value) -> Result<HlOrderOutcome, String> {
-    let payload = raw
-        .pointer("/data/response/payload")
-        .ok_or("missing websocket order response payload")?;
+    let payload = raw.pointer("/data/response/payload").unwrap_or(raw);
     if payload.get("type").and_then(Value::as_str) == Some("error") {
         return Err(payload
             .get("payload")
@@ -180,8 +178,9 @@ pub(crate) fn parse_default_action_response(raw: &Value) -> Result<(), String> {
 pub(crate) fn parse_cancel_response(raw: Value) -> Result<HlCancelResponse, String> {
     let statuses = raw
         .pointer("/data/response/payload/response/data/statuses")
+        .or_else(|| raw.pointer("/response/data/statuses"))
         .and_then(Value::as_array)
-        .ok_or("missing websocket cancel response statuses")?;
+        .ok_or("missing cancel response statuses")?;
     let statuses = statuses
         .iter()
         .map(|status| {

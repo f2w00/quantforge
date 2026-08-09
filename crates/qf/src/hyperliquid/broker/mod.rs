@@ -1,6 +1,7 @@
 pub mod backtest;
 pub mod error;
 pub mod live;
+pub mod rest;
 pub mod risk_adapter;
 pub mod state;
 pub mod traits;
@@ -10,4 +11,5 @@ pub use error::HlBrokerError;
 pub use live::{
     HlLiveBrokerConfig, HlMarginMode, HlMarketConfig, HlNetwork, HyperliquidLiveBroker,
 };
+pub use rest::{HlRestBrokerConfig, HyperliquidRestBroker};
 pub use traits::HyperliquidBroker;

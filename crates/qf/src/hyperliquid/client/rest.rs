@@ -47,6 +47,16 @@ impl HyperliquidRestClient {
         })
     }
 
+    pub async fn l2_book(&self, coin: &HlCoin) -> anyhow::Result<HlL2Book> {
+        let response: L2BookWire = self
+            .info(serde_json::json!({
+                "type": "l2Book",
+                "coin": coin.0,
+            }))
+            .await?;
+        response.try_into()
+    }
+
     pub async fn clearinghouse_state(&self, user: &str) -> anyhow::Result<HlAccountState> {
         let response: ClearinghouseStateWire = self
             .info(serde_json::json!({
@@ -190,6 +200,47 @@ pub struct HlSpotUsdcState {
     pub total: Decimal,
     pub hold: Decimal,
     pub available_after_maintenance: Decimal,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HlL2Book {
+    pub best_bid: Decimal,
+    pub best_ask: Decimal,
+}
+
+#[derive(Debug, Deserialize)]
+struct L2BookWire {
+    levels: Vec<Vec<L2LevelWire>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct L2LevelWire {
+    px: String,
+}
+
+impl TryFrom<L2BookWire> for HlL2Book {
+    type Error = anyhow::Error;
+
+    fn try_from(value: L2BookWire) -> Result<Self, Self::Error> {
+        let best_bid = value
+            .levels
+            .first()
+            .and_then(|levels| levels.first())
+            .ok_or_else(|| anyhow::anyhow!("l2Book has no bids"))?
+            .px
+            .parse()?;
+        let best_ask = value
+            .levels
+            .get(1)
+            .and_then(|levels| levels.first())
+            .ok_or_else(|| anyhow::anyhow!("l2Book has no asks"))?
+            .px
+            .parse()?;
+        if best_bid <= Decimal::ZERO || best_ask <= Decimal::ZERO {
+            anyhow::bail!("l2Book best prices must be positive");
+        }
+        Ok(Self { best_bid, best_ask })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -491,6 +542,35 @@ mod tests {
         }))
         .unwrap();
         assert!(invalid.usdc_state().is_err());
+    }
+
+    #[test]
+    fn parses_best_bid_and_ask_from_l2_book() {
+        let book: L2BookWire = serde_json::from_value(serde_json::json!({
+            "levels": [
+                [{"px": "99.5", "sz": "1", "n": 1}],
+                [{"px": "100.5", "sz": "2", "n": 1}]
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            HlL2Book::try_from(book).unwrap(),
+            HlL2Book {
+                best_bid: "99.5".parse().unwrap(),
+                best_ask: "100.5".parse().unwrap(),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_l2_book_without_both_sides() {
+        let book: L2BookWire = serde_json::from_value(serde_json::json!({
+            "levels": [[{"px": "99.5"}]]
+        }))
+        .unwrap();
+
+        assert!(HlL2Book::try_from(book).is_err());
     }
 
     #[test]

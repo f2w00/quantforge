@@ -50,6 +50,7 @@ pub async fn run(
     Ok(BacktestResult {
         final_position: broker
             .position(strategy.coin())
+            .await?
             .map(|position| position.size),
         performance,
     })

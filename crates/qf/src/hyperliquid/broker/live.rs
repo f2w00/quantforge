@@ -123,7 +123,7 @@ pub enum HlMarginMode {
 }
 
 impl HlMarginMode {
-    fn is_cross(self) -> bool {
+    pub(crate) fn is_cross(self) -> bool {
         matches!(self, Self::Cross)
     }
 
@@ -1707,13 +1707,13 @@ fn current_millis() -> u64 {
         .unwrap_or_default()
 }
 
-fn transport_error(error: impl std::fmt::Display) -> HlBrokerError {
+pub(crate) fn transport_error(error: impl std::fmt::Display) -> HlBrokerError {
     HlBrokerError::Transport {
         message: error.to_string(),
     }
 }
 
-fn protected_price(
+pub(crate) fn protected_price(
     reference: crate::core::Decimal,
     side: crate::core::Side,
     max_slippage_bps: u32,
@@ -1727,7 +1727,7 @@ fn protected_price(
     }
 }
 
-fn normalize_order_precision(
+pub(crate) fn normalize_order_precision(
     size: crate::core::Decimal,
     price: crate::core::Decimal,
     size_decimals: u32,
@@ -1749,7 +1749,7 @@ fn normalize_order_precision(
     Ok((normalized_size, normalized_price))
 }
 
-fn ensure_minimum_order_notional(
+pub(crate) fn ensure_minimum_order_notional(
     size: crate::core::Decimal,
     price: crate::core::Decimal,
 ) -> Result<(), HlBrokerError> {
@@ -1763,7 +1763,7 @@ fn ensure_minimum_order_notional(
     Ok(())
 }
 
-fn resolve_margin_fraction_size(
+pub(crate) fn resolve_margin_fraction_size(
     total_collateral: Decimal,
     available_collateral: Decimal,
     reference_price: Decimal,
@@ -2007,11 +2007,11 @@ impl HyperliquidLiveBroker {
                 margin_fraction,
                 reserve_fraction,
             } => {
-                let markets = self
-                    .markets
-                    .lock()
-                    .map_err(|_| HlBrokerError::StateUnavailable)?;
-                let market =
+                let leverage = {
+                    let markets = self
+                        .markets
+                        .lock()
+                        .map_err(|_| HlBrokerError::StateUnavailable)?;
                     markets
                         .get(&request.coin)
                         .ok_or_else(|| HlBrokerError::InvalidRequest {
@@ -2019,8 +2019,10 @@ impl HyperliquidLiveBroker {
                                 "margin-fraction sizing requires configured leverage for {}",
                                 request.coin.0
                             ),
-                        })?;
-                let account = self.account_state()?;
+                        })?
+                        .leverage
+                };
+                let account = self.account_state().await?;
                 let available_collateral = self
                     .collateral
                     .read()
@@ -2030,7 +2032,7 @@ impl HyperliquidLiveBroker {
                 let available_after_reserve =
                     (available_collateral - reserve_margin).max(Decimal::ZERO);
                 let planned_margin = available_after_reserve * margin_fraction;
-                let planned_notional = planned_margin * Decimal::from(market.leverage);
+                let planned_notional = planned_margin * Decimal::from(leverage);
                 sizing_audit = Some(serde_json::json!({
                     "total_collateral": account.equity.to_string(),
                     "available_collateral": available_collateral.to_string(),
@@ -2047,7 +2049,7 @@ impl HyperliquidLiveBroker {
                     available_collateral,
                     price,
                     size_decimals,
-                    market.leverage,
+                    leverage,
                     margin_fraction,
                     reserve_fraction,
                 )?
@@ -2296,6 +2298,7 @@ impl HyperliquidLiveBroker {
     ) -> Result<HlOrderResult, HlBrokerError> {
         let position = self
             .position(&request.coin)
+            .await?
             .filter(|position| position.size != crate::core::Decimal::ZERO)
             .ok_or_else(|| HlBrokerError::PositionUnavailable {
                 coin: request.coin.clone(),
@@ -2344,18 +2347,18 @@ impl HyperliquidLiveBroker {
 
 #[async_trait::async_trait]
 impl HyperliquidBroker for HyperliquidLiveBroker {
-    fn account_state(&self) -> Result<HlAccountState, HlBrokerError> {
+    async fn account_state(&self) -> Result<HlAccountState, HlBrokerError> {
         self.state
             .read()
             .map(|state| state.account.clone())
             .map_err(|_| HlBrokerError::StateUnavailable)
     }
 
-    fn open_orders(&self) -> Vec<HlOpenOrder> {
+    async fn open_orders(&self) -> Result<Vec<HlOpenOrder>, HlBrokerError> {
         self.state
             .read()
             .map(|state| state.open_orders.clone())
-            .unwrap_or_default()
+            .map_err(|_| HlBrokerError::StateUnavailable)
     }
 
     async fn place_order(&self, request: HlOrderRequest) -> Result<HlOrderResult, HlBrokerError> {
@@ -2512,7 +2515,7 @@ fn resolve_market_config(
     })
 }
 
-fn resolve_margin_mode(
+pub(crate) fn resolve_margin_mode(
     requested: HlMarginMode,
     only_isolated: bool,
     coin: &HlCoin,

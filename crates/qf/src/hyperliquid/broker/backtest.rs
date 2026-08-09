@@ -611,18 +611,18 @@ fn ensure_sufficient_margin(
 
 #[async_trait::async_trait]
 impl HyperliquidBroker for HyperliquidBacktestBroker {
-    fn account_state(&self) -> Result<HlAccountState, HlBrokerError> {
+    async fn account_state(&self) -> Result<HlAccountState, HlBrokerError> {
         self.inner
             .lock()
             .map(|inner| inner.state.account.clone())
             .map_err(|_| HlBrokerError::StateUnavailable)
     }
 
-    fn open_orders(&self) -> Vec<HlOpenOrder> {
+    async fn open_orders(&self) -> Result<Vec<HlOpenOrder>, HlBrokerError> {
         self.inner
             .lock()
             .map(|inner| inner.state.open_orders.clone())
-            .unwrap_or_default()
+            .map_err(|_| HlBrokerError::StateUnavailable)
     }
 
     async fn place_order(&self, request: HlOrderRequest) -> Result<HlOrderResult, HlBrokerError> {
@@ -751,6 +751,7 @@ impl HyperliquidBroker for HyperliquidBacktestBroker {
     ) -> Result<HlOrderResult, HlBrokerError> {
         let position = self
             .position(&request.coin)
+            .await?
             .filter(|position| position.size != Decimal::ZERO)
             .ok_or_else(|| HlBrokerError::PositionUnavailable {
                 coin: request.coin.clone(),
@@ -884,7 +885,7 @@ mod tests {
                 ..
             } if *total_size == decimal("2") && *avg_price == decimal("100")
         ));
-        let position = broker.position(&coin).unwrap();
+        let position = broker.position(&coin).await.unwrap().unwrap();
         assert_eq!(position.size, decimal("2"));
         assert_eq!(position.entry_price, Some(decimal("100")));
         assert_eq!(position.notional, decimal("200"));
@@ -906,7 +907,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            broker.position(&coin).unwrap().entry_price,
+            broker.position(&coin).await.unwrap().unwrap().entry_price,
             Some(decimal("110"))
         );
 
@@ -918,7 +919,10 @@ mod tests {
 
         assert_eq!(broker.realized_pnl(), decimal("20"));
         assert_eq!(broker.unrealized_pnl(), decimal("20"));
-        assert_eq!(broker.account_state().unwrap().equity, decimal("1040"));
+        assert_eq!(
+            broker.account_state().await.unwrap().equity,
+            decimal("1040")
+        );
     }
 
     #[tokio::test]
@@ -943,9 +947,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(broker.position(&coin).is_none());
+        assert!(broker.position(&coin).await.unwrap().is_none());
         assert_eq!(broker.realized_pnl(), decimal("50"));
-        assert_eq!(broker.account_state().unwrap().equity, decimal("1050"));
+        assert_eq!(
+            broker.account_state().await.unwrap().equity,
+            decimal("1050")
+        );
     }
 
     #[tokio::test]
@@ -969,7 +976,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(broker.position(&coin).unwrap().size, decimal("1.5"));
+        assert_eq!(
+            broker.position(&coin).await.unwrap().unwrap().size,
+            decimal("1.5")
+        );
         assert_eq!(result.submitted.size, decimal("0.5"));
         assert!(result.submitted.client_order_id.as_str().starts_with("0x"));
     }
@@ -996,7 +1006,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.submitted.size, decimal("0.5"));
-        assert_eq!(broker.position(&coin).unwrap().size, decimal("1.5"));
+        assert_eq!(
+            broker.position(&coin).await.unwrap().unwrap().size,
+            decimal("1.5")
+        );
     }
 
     #[tokio::test]
@@ -1026,9 +1039,18 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.submitted.size, decimal("20"));
-        assert_eq!(broker.position(&coin).unwrap().size, decimal("20"));
-        assert_eq!(broker.position(&coin).unwrap().leverage, decimal("5"));
-        assert_eq!(broker.account_state().unwrap().margin_used, decimal("400"));
+        assert_eq!(
+            broker.position(&coin).await.unwrap().unwrap().size,
+            decimal("20")
+        );
+        assert_eq!(
+            broker.position(&coin).await.unwrap().unwrap().leverage,
+            decimal("5")
+        );
+        assert_eq!(
+            broker.account_state().await.unwrap().margin_used,
+            decimal("400")
+        );
     }
 
     #[tokio::test]
@@ -1049,11 +1071,14 @@ mod tests {
             HlOrderOutcome::Filled { avg_price, .. } if avg_price == decimal("101")
         ));
         assert_eq!(
-            broker.position(&coin).unwrap().entry_price,
+            broker.position(&coin).await.unwrap().unwrap().entry_price,
             Some(decimal("101"))
         );
         assert_eq!(broker.trading_fees(), decimal("0.404"));
-        assert_eq!(broker.account_state().unwrap().equity, decimal("997.596"));
+        assert_eq!(
+            broker.account_state().await.unwrap().equity,
+            decimal("997.596")
+        );
     }
 
     #[tokio::test]
@@ -1069,7 +1094,7 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("exceeds order maximum"));
-        assert!(broker.position(&coin).is_none());
+        assert!(broker.position(&coin).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1084,8 +1109,14 @@ mod tests {
 
         broker.set_leverage(coin.clone(), 4).unwrap();
 
-        assert_eq!(broker.position(&coin).unwrap().leverage, decimal("4"));
-        assert_eq!(broker.account_state().unwrap().margin_used, decimal("50"));
+        assert_eq!(
+            broker.position(&coin).await.unwrap().unwrap().leverage,
+            decimal("4")
+        );
+        assert_eq!(
+            broker.account_state().await.unwrap().margin_used,
+            decimal("50")
+        );
     }
 
     #[tokio::test]
@@ -1100,7 +1131,7 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("insufficient equity"));
-        assert!(broker.position(&coin).is_none());
+        assert!(broker.position(&coin).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1120,7 +1151,10 @@ mod tests {
 
         assert_eq!(cashflow, decimal("-0.2"));
         assert_eq!(broker.funding_pnl(), decimal("-0.2"));
-        assert_eq!(broker.account_state().unwrap().equity, decimal("999.8"));
+        assert_eq!(
+            broker.account_state().await.unwrap().equity,
+            decimal("999.8")
+        );
         assert!(
             broker
                 .apply_funding(coin, decimal("0.001"), decimal("100"), settled_at)
@@ -1224,10 +1258,13 @@ mod tests {
 
         broker.set_mark_price(coin.clone(), decimal("10")).unwrap();
 
-        assert!(broker.position(&coin).is_none());
+        assert!(broker.position(&coin).await.unwrap().is_none());
         assert_eq!(broker.liquidation_count(), 1);
         assert_eq!(broker.realized_pnl(), decimal("-9000"));
-        assert_eq!(broker.account_state().unwrap().margin_used, Decimal::ZERO);
+        assert_eq!(
+            broker.account_state().await.unwrap().margin_used,
+            Decimal::ZERO
+        );
     }
 
     #[tokio::test]
@@ -1245,7 +1282,10 @@ mod tests {
         let error = broker.place_order(request).await.unwrap_err();
 
         assert!(error.to_string().contains("would increase"));
-        assert_eq!(broker.position(&coin).unwrap().size, decimal("1"));
+        assert_eq!(
+            broker.position(&coin).await.unwrap().unwrap().size,
+            decimal("1")
+        );
     }
 
     #[tokio::test]

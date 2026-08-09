@@ -46,7 +46,7 @@ impl ExampleStrategy {
             return Ok(());
         }
 
-        let position = broker.position(&self.coin);
+        let position = broker.position(&self.coin).await?;
         if position.is_some_and(|position| position.size != Decimal::ZERO) {
             self.held_ticks += 1;
             if self.held_ticks >= self.hold_ticks {

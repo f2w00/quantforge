@@ -65,6 +65,8 @@ async fn mainnet_places_and_closes_doge_market_order_inner(audit: MemoryAuditSin
 
     if broker
         .position(&coin)
+        .await
+        .context("read Mainnet DOGE position")?
         .is_some_and(|position| position.size != Decimal::ZERO)
     {
         bail!("Mainnet DOGE position must be flat before running this test");
@@ -197,6 +199,7 @@ async fn hold_connection_with_open_position(
         }
         let account = broker
             .account_state()
+            .await
             .context("read live account state while holding position")?;
         let position = account
             .positions
@@ -207,6 +210,8 @@ async fn hold_connection_with_open_position(
         }
         if broker
             .open_orders_for(coin)
+            .await
+            .context("read live DOGE open orders")?
             .iter()
             .any(|order| order.reduce_only)
         {
@@ -226,15 +231,17 @@ async fn wait_for_position(
         loop {
             let is_open = broker
                 .position(coin)
+                .await
+                .context("read live DOGE position")?
                 .is_some_and(|position| position.size != Decimal::ZERO);
             if is_open == expected_open {
-                return;
+                return Ok::<(), anyhow::Error>(());
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })
     .await
-    .context("wait for Mainnet position update")?;
+    .context("wait for Mainnet position update")??;
     Ok(())
 }
 

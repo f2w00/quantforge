@@ -52,7 +52,7 @@ async fn main() -> Result<()> {
     )
     .await?;
 
-    record_startup_sizing(&journal, &broker, &coin)?;
+    record_startup_sizing(&journal, &broker, &coin).await?;
     ensure_account_is_idle(&broker, &coin).await?;
     println!("testnet soak started for {SOAK_COIN}; press Ctrl-C to stop");
 
@@ -111,13 +111,14 @@ fn soak_order_size() -> HlOrderSize {
     }
 }
 
-fn record_startup_sizing(
+async fn record_startup_sizing(
     journal: &RunJournal,
     broker: &HyperliquidLiveBroker,
     coin: &HlCoin,
 ) -> Result<()> {
     let account = broker
         .account_state()
+        .await
         .context("account state is unavailable for sizing audit")?;
     let mid_price = broker
         .mid_price(coin)
@@ -342,8 +343,8 @@ fn elapsed_ms(started: Instant) -> u128 {
 }
 
 async fn ensure_account_is_idle(broker: &HyperliquidLiveBroker, coin: &HlCoin) -> Result<()> {
-    let position = broker.position(coin);
-    let open_orders = broker.open_orders_for(coin);
+    let position = broker.position(coin).await?;
+    let open_orders = broker.open_orders_for(coin).await?;
     if position.is_some_and(|position| position.size != Decimal::ZERO) || !open_orders.is_empty() {
         bail!(
             "refusing to trade while {} has an existing position or open order",
@@ -358,15 +359,17 @@ async fn wait_until_position_exists(broker: &HyperliquidLiveBroker, coin: &HlCoi
         loop {
             if broker
                 .position(coin)
+                .await
+                .context("position state is unavailable")?
                 .is_some_and(|position| position.size != Decimal::ZERO)
             {
-                return;
+                return Ok::<(), anyhow::Error>(());
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
     })
     .await
-    .context("position was not observed after entry probe")?;
+    .context("position was not observed after entry probe")??;
     Ok(())
 }
 
