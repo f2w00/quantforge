@@ -43,6 +43,7 @@ pub struct HlUserFill {
     pub price: Option<Decimal>,
     pub fee: Option<Decimal>,
     pub side: Option<Side>,
+    pub direction: Option<String>,
     pub timestamp: Option<Timestamp>,
     pub trade_id: Option<String>,
     pub raw: Value,
@@ -69,6 +70,11 @@ pub(crate) fn user_fills(message: &Value) -> Vec<HlUserFill> {
         .into_iter()
         .map(|value| parse_user_fill(message, value))
         .collect()
+}
+
+/// 解析账户或 leader 的成交推送，供策略层消费。
+pub fn parse_user_fills(message: &Value) -> Vec<HlUserFill> {
+    user_fills(message)
 }
 
 pub(crate) fn funding_events(message: &Value) -> Vec<Value> {
@@ -274,6 +280,7 @@ pub(crate) fn parse_user_fill(message: &Value, value: &Value) -> HlUserFill {
             Some("A") | Some("Sell") => Some(Side::Sell),
             _ => None,
         },
+        direction: string_field(value, &["dir", "direction"]),
         timestamp: value
             .get("time")
             .and_then(|value| {

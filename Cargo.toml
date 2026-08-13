@@ -5,6 +5,7 @@ members = [
     "strategies/follow-sar",
     "strategies/live-broker-soak",
     "strategies/yessir",
+    "strategies/hype-copy",
 ]
 resolver = "2"
 

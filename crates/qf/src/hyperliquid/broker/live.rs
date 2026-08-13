@@ -2939,6 +2939,7 @@ mod tests {
             price: Some("100.5".parse().unwrap()),
             fee: Some("0.01".parse().unwrap()),
             side: Some(Side::Buy),
+            direction: None,
             timestamp: Some(timestamp),
             trade_id: Some("99".to_string()),
             raw: serde_json::Value::Null,
@@ -2976,6 +2977,7 @@ mod tests {
             price: Some(Decimal::from(100)),
             fee: None,
             side: Some(Side::Buy),
+            direction: None,
             timestamp: Some(
                 Utc.timestamp_millis_opt(1_700_000_000_000_i64)
                     .single()

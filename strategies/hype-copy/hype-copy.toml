@@ -1,0 +1,16 @@
+# 使用 leader 所在网络
+network = "mainnet"
+
+# 被跟单账户
+leader = "0xf97ad6704baec104d00b88e0c157e2b7b3a1ddd1"
+
+# follower 使用的杠杆
+leverage = 1
+
+# 仅 paper 模式使用的模拟初始净值
+initial_equity = "600"
+
+# 手续费和市价保护参数，单位 bps
+taker_fee_bps = 4
+market_slippage_bps = 100
+close_slippage_bps = 100
