@@ -97,6 +97,7 @@ impl FollowSarStrategy {
         let emergency = target_size.abs() < EMERGENCY_THRESHOLD;
         let own_position = broker
             .position(&self.coin)
+            .await?
             .filter(|position| position.size != Decimal::ZERO);
         if emergency {
             if own_position.is_some() {
@@ -134,6 +135,7 @@ impl FollowSarStrategy {
                 coin: self.coin.clone(),
                 side,
                 size: HlOrderSize::Exact(ENTRY_POSITION_SIZE),
+                leverage: Some(1),
                 reduce_only: false,
                 order_type: HlOrderType::Market {
                     max_slippage_bps: Some(self.max_slippage_bps),
@@ -162,6 +164,7 @@ impl FollowSarStrategy {
         let sar = sar_indicator.next(candle)?;
         let Some(position) = broker
             .position(&self.coin)
+            .await?
             .filter(|position| position.size != Decimal::ZERO)
         else {
             return Ok(());
@@ -278,7 +281,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            broker.position(&coin).unwrap().size,
+            broker.position(&coin).await.unwrap().unwrap().size,
             "1.215".parse().unwrap()
         );
         assert_eq!(strategy.active_profile(), Some(SarProfile::Scalp));
@@ -309,7 +312,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(broker.position(&coin).is_none());
+        assert!(broker.position(&coin).await.unwrap().is_none());
 
         strategy
             .on_event(
@@ -346,7 +349,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(broker.position(&coin).is_none());
+        assert!(broker.position(&coin).await.unwrap().is_none());
 
         strategy
             .on_event(&broker, FollowSarEvent::TargetPosition(None))
@@ -360,7 +363,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            broker.position(&coin).unwrap().size,
+            broker.position(&coin).await.unwrap().unwrap().size,
             "1.215".parse().unwrap()
         );
     }
@@ -389,7 +392,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(broker.position(&coin).is_none());
+        assert!(broker.position(&coin).await.unwrap().is_none());
         assert!(strategy.sar.is_none());
         assert_eq!(strategy.active_profile(), None);
         assert!(!strategy.target_above_threshold);

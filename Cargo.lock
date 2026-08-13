@@ -1735,6 +1735,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "hype-copy"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "anyhow",
+ "chrono",
+ "qf",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "hyper"
 version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

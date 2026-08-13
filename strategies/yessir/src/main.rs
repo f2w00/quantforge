@@ -94,7 +94,7 @@ async fn main() -> anyhow::Result<()> {
                 match message.get("channel").and_then(serde_json::Value::as_str) {
                     Some("allMids") => {
                         mids.apply_ws_message(&message)?;
-                        handle_mids(&mut leaders, &mids)?;
+                        handle_mids(&mut leaders, &mids).await?;
                     }
                     _ => {}
                 }
@@ -271,7 +271,7 @@ async fn spawn_leader_stream(
     Ok(())
 }
 
-fn handle_mids(leaders: &mut [Leader], mids: &HlMidSnapshot) -> anyhow::Result<()> {
+async fn handle_mids(leaders: &mut [Leader], mids: &HlMidSnapshot) -> anyhow::Result<()> {
     let now = Utc::now();
     for leader in leaders {
         if leader
@@ -280,7 +280,7 @@ fn handle_mids(leaders: &mut [Leader], mids: &HlMidSnapshot) -> anyhow::Result<(
         {
             continue;
         }
-        let positions = leader.broker.account_state()?.positions;
+        let positions = leader.broker.account_state().await?.positions;
         if positions.is_empty() {
             continue;
         }
@@ -357,6 +357,7 @@ async fn apply_snapshot(
                     Side::Sell
                 },
                 size: HlOrderSize::Exact(size),
+                leverage: Some(leverage),
                 reduce_only: false,
                 order_type: HlOrderType::Market {
                     max_slippage_bps: None,
@@ -519,7 +520,7 @@ mod tests {
         .await
         .unwrap();
 
-        let copied = leader.broker.position(&coin).unwrap();
+        let copied = leader.broker.position(&coin).await.unwrap().unwrap();
         assert_eq!(copied.size, Decimal::new(2, 1));
         assert_eq!(copied.leverage, Decimal::from(10));
     }

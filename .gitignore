@@ -5,4 +5,5 @@ runs
 **/runtest.sh
 strategies/mm-linkage
 strategies/mm-linkage2
-scripts
+scripts/*
+!scripts/run-hype-copy-paper.sh

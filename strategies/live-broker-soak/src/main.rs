@@ -10,8 +10,7 @@ use qf::hyperliquid::types::{
     HlOrderSize, HlOrderType, HlTimeInForce,
 };
 use qf::hyperliquid::{
-    HlLiveBrokerConfig, HlMarginMode, HlMarketConfig, HlNetwork, HyperliquidBroker,
-    HyperliquidLiveBroker,
+    HlLiveBrokerConfig, HlMarginMode, HlNetwork, HyperliquidBroker, HyperliquidLiveBroker,
 };
 use qf::risk::{RiskGuard, RiskLimits};
 use qf::storage::{JsonlAuditSink, JsonlWriter};
@@ -36,11 +35,7 @@ async fn main() -> Result<()> {
     let signer = Arc::new(HyperliquidSigner::from_private_key(&private_key)?);
     let mut config = HlLiveBrokerConfig::new(StrategyId::new("live-broker-soak"), account_address);
     config.network = HlNetwork::Testnet;
-    config.markets = vec![HlMarketConfig {
-        coin: coin.clone(),
-        leverage: 1,
-        margin_mode: HlMarginMode::Auto,
-    }];
+    config.default_margin_mode = HlMarginMode::Auto;
 
     let audit_path = std::env::var("QF_AUDIT_PATH")
         .unwrap_or_else(|_| "runs/live-broker-soak/audit.jsonl".to_string());
@@ -57,7 +52,7 @@ async fn main() -> Result<()> {
     )
     .await?;
 
-    record_startup_sizing(&journal, &broker, &coin)?;
+    record_startup_sizing(&journal, &broker, &coin).await?;
     ensure_account_is_idle(&broker, &coin).await?;
     println!("testnet soak started for {SOAK_COIN}; press Ctrl-C to stop");
 
@@ -116,13 +111,14 @@ fn soak_order_size() -> HlOrderSize {
     }
 }
 
-fn record_startup_sizing(
+async fn record_startup_sizing(
     journal: &RunJournal,
     broker: &HyperliquidLiveBroker,
     coin: &HlCoin,
 ) -> Result<()> {
     let account = broker
         .account_state()
+        .await
         .context("account state is unavailable for sizing audit")?;
     let mid_price = broker
         .mid_price(coin)
@@ -202,6 +198,7 @@ async fn run_round(
             coin: coin.clone(),
             side: Side::Buy,
             size: soak_order_size(),
+            leverage: Some(1),
             reduce_only: false,
             order_type: HlOrderType::Limit {
                 limit_price: mid * Decimal::new(99, 2),
@@ -248,6 +245,7 @@ async fn run_round(
             coin: coin.clone(),
             side: Side::Buy,
             size: soak_order_size(),
+            leverage: Some(1),
             reduce_only: false,
             order_type: HlOrderType::Market {
                 max_slippage_bps: Some(MAX_SLIPPAGE_BPS),
@@ -345,8 +343,8 @@ fn elapsed_ms(started: Instant) -> u128 {
 }
 
 async fn ensure_account_is_idle(broker: &HyperliquidLiveBroker, coin: &HlCoin) -> Result<()> {
-    let position = broker.position(coin);
-    let open_orders = broker.open_orders_for(coin);
+    let position = broker.position(coin).await?;
+    let open_orders = broker.open_orders_for(coin).await?;
     if position.is_some_and(|position| position.size != Decimal::ZERO) || !open_orders.is_empty() {
         bail!(
             "refusing to trade while {} has an existing position or open order",
@@ -361,15 +359,17 @@ async fn wait_until_position_exists(broker: &HyperliquidLiveBroker, coin: &HlCoi
         loop {
             if broker
                 .position(coin)
+                .await
+                .context("position state is unavailable")?
                 .is_some_and(|position| position.size != Decimal::ZERO)
             {
-                return;
+                return Ok::<(), anyhow::Error>(());
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
     })
     .await
-    .context("position was not observed after entry probe")?;
+    .context("position was not observed after entry probe")??;
     Ok(())
 }
 
@@ -420,6 +420,7 @@ impl LedgerSink for NoopLedgerSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qf::hyperliquid::HlMarginMode;
 
     #[test]
     fn random_interval_stays_within_the_configured_range() {
@@ -456,15 +457,13 @@ mod tests {
     }
 
     #[test]
-    fn soak_market_automatically_selects_the_supported_margin_mode() {
-        let market = HlMarketConfig {
-            coin: HlCoin::new(SOAK_COIN),
-            leverage: 1,
-            margin_mode: HlMarginMode::Auto,
-        };
+    fn soak_uses_auto_as_the_global_margin_mode() {
+        let config = HlLiveBrokerConfig::new(
+            StrategyId::new("live-broker-soak-test"),
+            alloy::primitives::Address::ZERO,
+        );
 
-        assert_eq!(market.coin, HlCoin::new("BTC"));
-        assert_eq!(market.leverage, 1);
-        assert_eq!(market.margin_mode, HlMarginMode::Auto);
+        assert_eq!(config.default_margin_mode, HlMarginMode::Auto);
+        assert!(config.markets.is_empty());
     }
 }

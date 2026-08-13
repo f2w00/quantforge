@@ -11,11 +11,11 @@ use super::HlBrokerError;
 /// 不直接接触 REST/WS client、signer 或 API key。
 #[async_trait::async_trait]
 pub trait HyperliquidBroker: Send + Sync {
-    /// 返回 broker 当前维护的本地账户快照，不主动发起远端同步。
-    fn account_state(&self) -> Result<HlAccountState, HlBrokerError>;
+    /// 返回账户快照；具体实现可按需从远端查询。
+    async fn account_state(&self) -> Result<HlAccountState, HlBrokerError>;
 
-    /// 返回账户级本地 open order 快照。
-    fn open_orders(&self) -> Vec<HlOpenOrder>;
+    /// 返回账户级 open order 快照；具体实现可按需从远端查询。
+    async fn open_orders(&self) -> Result<Vec<HlOpenOrder>, HlBrokerError>;
 
     async fn place_order(&self, request: HlOrderRequest) -> Result<HlOrderResult, HlBrokerError>;
 
@@ -24,20 +24,22 @@ pub trait HyperliquidBroker: Send + Sync {
         request: HlCancelRequest,
     ) -> Result<HlCancelResponse, HlBrokerError>;
 
-    /// 根据本地仓位提交 reduce-only 市价平仓单，不保证返回时仓位已经归零。
+    /// 根据当前仓位提交 reduce-only 市价平仓单，不保证返回时仓位已经归零。
     async fn close_position(&self, request: HlCloseRequest)
     -> Result<HlOrderResult, HlBrokerError>;
 
-    /// 返回指定 coin 的本地仓位快照。
-    fn position(&self, coin: &HlCoin) -> Option<HlPosition> {
-        self.account_state().ok()?.positions.get(coin).cloned()
+    /// 返回指定 coin 的仓位快照。
+    async fn position(&self, coin: &HlCoin) -> Result<Option<HlPosition>, HlBrokerError> {
+        Ok(self.account_state().await?.positions.get(coin).cloned())
     }
 
-    /// 返回指定 coin 的本地 open order 快照。
-    fn open_orders_for(&self, coin: &HlCoin) -> Vec<HlOpenOrder> {
-        self.open_orders()
+    /// 返回指定 coin 的 open order 快照。
+    async fn open_orders_for(&self, coin: &HlCoin) -> Result<Vec<HlOpenOrder>, HlBrokerError> {
+        Ok(self
+            .open_orders()
+            .await?
             .into_iter()
             .filter(|order| &order.coin == coin)
-            .collect()
+            .collect())
     }
 }
